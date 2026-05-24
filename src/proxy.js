@@ -123,7 +123,7 @@ async function start(config = loadConfig()) {
         }
         reject(err);
       });
-      upReq.setTimeout(300000, () => upReq.destroy(new Error('upstream timeout')));
+      upReq.setTimeout(1800000, () => upReq.destroy(new Error('upstream timeout')));
       upReq.write(body);
       upReq.end();
     });
@@ -148,7 +148,7 @@ async function start(config = loadConfig()) {
         }
       );
       upReq.on('error', reject);
-      upReq.setTimeout(300000, () => upReq.destroy(new Error('upstream timeout')));
+      upReq.setTimeout(1800000, () => upReq.destroy(new Error('upstream timeout')));
       upReq.write(body);
       upReq.end();
     });
