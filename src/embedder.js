@@ -1,36 +1,45 @@
 /**
- * embedder.js — Ollama embedding client
- * Calls nomic-embed-cpu (or any Ollama embedding model) to produce vectors.
+ * embedder.js — Ollama embedding client.
+ *
+ * Thin wrapper over Ollama's /api/embed. Exposes `.model` so callers can
+ * tag stored vectors with the model that produced them — that way we can
+ * skip cosine similarity against vectors from an incompatible model (which
+ * would otherwise return arithmetic-noise values).
  */
 
-const http = require('http');
+const { post } = require('./lib/ollama.js');
+const log      = require('./lib/logger.js').make('embedder');
 
 class Embedder {
   constructor(ollamaUrl, model) {
     this.ollamaUrl = ollamaUrl;
-    this.model = model;
+    this.model     = model;
   }
 
   /**
    * Embed a single string. Returns Float32Array or null on failure.
+   * Failures are logged and swallowed — the caller decides whether a
+   * missing embedding is fatal (selector skips those rows in similarity).
    */
   async embed(text) {
+    if (!text) return null;
     const body = JSON.stringify({ model: this.model, input: text });
     try {
-      const raw = await this._post('/api/embed', body);
+      const raw  = await post(this.ollamaUrl, '/api/embed', body, { timeoutMs: 30000 });
       const data = JSON.parse(raw);
-      // Ollama /api/embed returns { embeddings: [[...]] }
-      const vec = data.embeddings?.[0] ?? data.embedding;
+      const vec  = data.embeddings?.[0] ?? data.embedding;
       if (!vec) return null;
       return new Float32Array(vec);
     } catch (err) {
-      console.warn('[embedder] embed failed:', err.message);
+      log.warn('embed failed:', err.message);
       return null;
     }
   }
 
   /**
    * Cosine similarity between two Float32Arrays.
+   * Returns 0 for missing vectors or mismatched lengths so callers can
+   * always pass the result straight into a sort comparator.
    */
   static cosine(a, b) {
     if (!a || !b || a.length !== b.length) return 0;
@@ -42,28 +51,6 @@ class Embedder {
     }
     const denom = Math.sqrt(na) * Math.sqrt(nb);
     return denom === 0 ? 0 : dot / denom;
-  }
-
-  _post(path, body) {
-    return new Promise((resolve, reject) => {
-      const url = new URL(this.ollamaUrl);
-      const opts = {
-        hostname: url.hostname,
-        port:     url.port || 80,
-        path,
-        method:   'POST',
-        headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
-      };
-      const req = http.request(opts, res => {
-        let buf = '';
-        res.on('data', d => buf += d);
-        res.on('end', () => resolve(buf));
-      });
-      req.on('error', reject);
-      req.setTimeout(30000, () => { req.destroy(); reject(new Error('embed timeout')); });
-      req.write(body);
-      req.end();
-    });
   }
 }
 

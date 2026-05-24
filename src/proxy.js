@@ -1,253 +1,288 @@
 #!/usr/bin/env node
 /**
- * proxy.js — Anamnesis main server
+ * proxy.js — Anamnesis main server.
  *
- * Works with any OpenAI-compatible backend:
- *   llama-server, Ollama (/v1), LM Studio, koboldcpp, OpenAI, etc.
- *   Just set upstream.baseUrl + upstream.apiKey in config.json.
+ * Works with any OpenAI-compatible backend (llama-server, Ollama /v1,
+ * LM Studio, koboldcpp, OpenAI itself, …). Set upstream.baseUrl +
+ * upstream.apiKey in config.json.
  *
- * Startup sequence:
- *   1. Process backlog of unextracted turns from previous sessions
- *   2. Start consolidation timer
- *   3. Begin listening
- *
- * Per-request pipeline:
- *   1. Store user turn (synchronous — survives any crash)
- *   2. Scene-guided context selection
+ * Per-request pipeline (POST /…/chat/completions):
+ *   1. Persist user turn synchronously  (survives any subsequent crash)
+ *   2. Scene-guided context selection   (drops in <memory>/<foresight> blocks)
  *   3. Forward to upstream
- *   4. Return response to client
- *   5. Store assistant turn + trigger background MemCell extraction (non-blocking)
+ *      - streaming    : pipe each SSE chunk through to the client and tee
+ *                       a copy into an accumulator that reconstructs the
+ *                       final assistant content from delta frames.
+ *      - non-streaming: buffer upstream, return, then parse content.
+ *   4. Persist the assistant turn + kick off background extraction
+ *      (memcell + foresight, both non-blocking).
  *
  * Graceful shutdown (SIGTERM/SIGINT):
- *   - Wait for in-flight extraction to finish (max 15s)
- *   - Then exit cleanly
+ *   - Stop the consolidator timer
+ *   - Wait up to 15s for in-flight extraction
+ *   - Close the SQLite handle
  */
 
-const http    = require('http');
-const https   = require('https');
-const path    = require('path');
-const fs      = require('fs');
+const http  = require('http');
+const https = require('https');
+const path  = require('path');
+const fs    = require('fs');
 
-const config       = JSON.parse(fs.readFileSync(path.join(__dirname, '../config.json'), 'utf8'));
-const HistoryStore = require('./history.js');
-const Embedder     = require('./embedder.js');
-const Selector     = require('./selector.js');
+const {
+  expandHome, getSessionKey, buildUpstreamHeaders, makeSseAccumulator,
+} = require('./lib/proxy-helpers.js');
+const log = require('./lib/logger.js').make('anamnesis');
+
+const HistoryStore       = require('./history.js');
+const Embedder           = require('./embedder.js');
+const Selector           = require('./selector.js');
 const Extractor          = require('./extractor.js');
 const ForesightExtractor = require('./foresight.js');
 const Consolidator       = require('./consolidator.js');
 
-const history      = new HistoryStore(config.history.dbPath);
-const embedder     = new Embedder(config.embedding.ollamaUrl, config.embedding.model);
-const selector     = new Selector(config, history, embedder);
-const extractor          = new Extractor(config, history, embedder);
-const foresightExtractor = new ForesightExtractor(config, history);
-const consolidator       = new Consolidator(config, history, embedder);
-
-// Prune old turns
-const pruned = history.prune(config.history.maxAgeDays);
-if (pruned > 0) console.log(`[anamnesis] pruned ${pruned} old turns`);
-
-// ─── Startup: process any unextracted turns from previous sessions ───────────
-extractor.processBacklog().catch(e =>
-  console.warn('[anamnesis] backlog processing error:', e.message)
-);
-foresightExtractor.processBacklog().catch(e =>
-  console.warn('[anamnesis] foresight backlog error:', e.message)
-);
-
-// Start background consolidation
-consolidator.start(config.memory.consolidationIntervalMs);
-
-// ─── Session key ─────────────────────────────────────────────────────────────
-function getSessionKey(req) {
-  const ocSession = req.headers['x-openclaw-session'] ?? req.headers['x-session-id'] ?? '';
-  if (ocSession) return `oc:${ocSession}`;
-  const auth = req.headers['authorization'] ?? '';
-  // Strip "Bearer " prefix and use last 16 chars as key
-  const token = auth.replace(/^Bearer\s+/i, '');
-  if (token && token !== config.upstream.apiKey) return `auth:${token.slice(-16)}`;
-  return 'default';
+function loadConfig() {
+  return expandHome(JSON.parse(fs.readFileSync(path.join(__dirname, '../config.json'), 'utf8')));
 }
 
-// ─── Universal upstream forwarding ───────────────────────────────────────────
-function forward(reqOpts, body) {
-  return new Promise((resolve, reject) => {
-    const upUrl   = new URL(config.upstream.baseUrl);
-    const isHttps = upUrl.protocol === 'https:';
-    const lib     = isHttps ? https : http;
+function start(config = loadConfig()) {
+  const history            = new HistoryStore(config.history.dbPath);
+  const embedder           = new Embedder(config.embedding.ollamaUrl, config.embedding.model);
+  const selector           = new Selector(config, history, embedder);
+  const extractor          = new Extractor(config, history, embedder);
+  const foresightExtractor = new ForesightExtractor(config, history);
+  const consolidator       = new Consolidator(config, history, embedder);
 
-    // Build headers — inject upstream API key, strip proxy-internal headers
-    const headers = { ...reqOpts.headers };
-    delete headers['x-openclaw-session'];
-    delete headers['x-session-id'];
-    delete headers['host'];
-    // Remove all case variants of Content-Length before setting the correct one
-    Object.keys(headers).forEach(k => { if (k.toLowerCase() === 'content-length') delete headers[k]; });
-    headers['Authorization']  = config.upstream.apiKey ? `Bearer ${config.upstream.apiKey}` : undefined;
-    headers['Content-Length'] = Buffer.byteLength(body);
-    // Remove undefined headers
-    Object.keys(headers).forEach(k => headers[k] === undefined && delete headers[k]);
+  const pruned = history.prune(config.history.maxAgeDays);
+  if (pruned > 0) log.info(`pruned ${pruned} old turns`);
 
-    const opts = {
-      hostname: upUrl.hostname,
-      port:     upUrl.port || (isHttps ? 443 : 80),
-      path:     upUrl.pathname.replace(/\/$/, '') + (reqOpts.url ?? reqOpts.path),
-      method:   reqOpts.method,
-      headers,
+  // Pick up turns that crashed mid-extraction in a previous session.
+  extractor.processBacklog().catch((e) => log.warn('backlog (extractor):', e.message));
+  foresightExtractor.processBacklog().catch((e) => log.warn('backlog (foresight):', e.message));
+
+  consolidator.start(config.memory.consolidationIntervalMs);
+
+  // ─── Upstream wiring ──────────────────────────────────────────────────────
+
+  function upstreamUrl(reqPath) {
+    const upUrl = new URL(config.upstream.baseUrl);
+    return {
+      upUrl,
+      lib:  upUrl.protocol === 'https:' ? https : http,
+      port: upUrl.port || (upUrl.protocol === 'https:' ? 443 : 80),
+      path: upUrl.pathname.replace(/\/$/, '') + reqPath,
     };
+  }
 
-    const req = lib.request(opts, res => {
-      const chunks = [];
-      res.on('data', d => chunks.push(d));
-      res.on('end', () => resolve({
-        status:  res.statusCode,
-        headers: res.headers,
-        body:    Buffer.concat(chunks)
-      }));
+  /**
+   * Pipe upstream response straight to the client, AND tee each chunk into
+   * `onChunk` so callers can rebuild assistant content for storage.
+   */
+  function streamThrough(reqPath, method, headers, body, clientRes, onChunk) {
+    return new Promise((resolve, reject) => {
+      const { upUrl, lib, port, path: outPath } = upstreamUrl(reqPath);
+      const upReq = lib.request(
+        { hostname: upUrl.hostname, port, path: outPath, method, headers },
+        (upRes) => {
+          const outHeaders = { ...upRes.headers };
+          // Don't repeat hop-by-hop headers to the client.
+          delete outHeaders['transfer-encoding'];
+          delete outHeaders['connection'];
+          clientRes.writeHead(upRes.statusCode, outHeaders);
+
+          upRes.on('data', (chunk) => {
+            clientRes.write(chunk);
+            try { onChunk(chunk); } catch (e) { log.warn('onChunk error:', e.message); }
+          });
+          upRes.on('end',   () => { clientRes.end(); resolve(); });
+          upRes.on('error', (err) => { clientRes.end(); reject(err); });
+        }
+      );
+      upReq.on('error', (err) => {
+        if (!clientRes.headersSent) {
+          clientRes.writeHead(502, { 'Content-Type': 'application/json' });
+          clientRes.end(JSON.stringify({ error: err.message }));
+        } else {
+          clientRes.end();
+        }
+        reject(err);
+      });
+      upReq.setTimeout(300000, () => upReq.destroy(new Error('upstream timeout')));
+      upReq.write(body);
+      upReq.end();
     });
-    req.on('error', reject);
-    req.setTimeout(300000, () => { req.destroy(); reject(new Error('upstream timeout')); });
-    req.write(body);
-    req.end();
-  });
-}
-
-
-// Safely extract plain text from a message content field.
-// OpenAI-compatible APIs allow content to be a string OR an array of
-// content parts ({type:'text',text:'...'} etc). SQLite only takes strings.
-function extractContentText(content) {
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content
-      .filter(p => p?.type === 'text' || p?.text)
-      .map(p => p?.text ?? p?.content ?? '')
-      .join('\n')
-      .trim() || JSON.stringify(content);
-  }
-  if (content && typeof content === 'object') return JSON.stringify(content);
-  return String(content ?? '');
-}
-
-// ─── Server ──────────────────────────────────────────────────────────────────
-const server = http.createServer((req, res) => {
-  // Status endpoint
-  if (req.method === 'GET' && req.url === '/anamnesis/status') {
-    const stats = history.stats('default');
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok', ...stats, upstream: config.upstream.baseUrl }));
   }
 
-  const chunks = [];
-  req.on('data', d => chunks.push(d));
-  req.on('end', async () => {
-    const rawBody = Buffer.concat(chunks);
+  function bufferedForward(reqPath, method, headers, body) {
+    return new Promise((resolve, reject) => {
+      const { upUrl, lib, port, path: outPath } = upstreamUrl(reqPath);
+      const upReq = lib.request(
+        { hostname: upUrl.hostname, port, path: outPath, method, headers },
+        (upRes) => {
+          const chunks = [];
+          upRes.on('data', (d) => chunks.push(d));
+          upRes.on('end', () =>
+            resolve({ status: upRes.statusCode, headers: upRes.headers, body: Buffer.concat(chunks) })
+          );
+          upRes.on('error', reject);
+        }
+      );
+      upReq.on('error', reject);
+      upReq.setTimeout(300000, () => upReq.destroy(new Error('upstream timeout')));
+      upReq.write(body);
+      upReq.end();
+    });
+  }
 
-    if (req.method === 'POST' && req.url.endsWith('/chat/completions')) {
-      let parsed;
-      try { parsed = JSON.parse(rawBody.toString()); }
-      catch { return passthrough(req, res, rawBody); }
-      if (!Array.isArray(parsed.messages)) return passthrough(req, res, rawBody);
-
-      const sessionKey = getSessionKey(req);
-      const streaming  = parsed.stream === true;
-
-      // 1. Store user turn immediately (synchronous — survives shutdown)
-      const userMsg = [...parsed.messages].reverse().find(m => m.role === 'user');
-      if (userMsg?.content) {
-        // Normalise content — can be string or array of content parts
-        const userText = extractContentText(userMsg.content);
-        // Embed async — if it fails, store without embedding
-        const vec = await embedder.embed(userText.slice(0, 2000)).catch(() => null);
-        const est = Math.ceil(userText.length / config.context.charsPerToken);
-        history.insertTurn(sessionKey, 'user', userText, vec, est);
-      }
-
-      // 2. Scene-guided context selection
-      let selectedMessages = parsed.messages;
+  function recordAssistantTurn(sessionKey, content) {
+    if (!content) return;
+    // Defer to the next tick so the client connection is fully closed first;
+    // embedding + extraction never block the response.
+    setImmediate(async () => {
       try {
-        selectedMessages = await selector.select(sessionKey, parsed.messages);
-      } catch (err) {
-        console.error('[anamnesis] selector error, using original:', err.message);
+        const vec = await embedder.embed(content.slice(0, 2000)).catch(() => null);
+        const est = Math.ceil(content.length / config.context.charsPerToken);
+        history.insertTurn(sessionKey, 'assistant', content, vec, est, embedder.model);
+        extractor.processBatch().catch((e) => log.warn('extractor:', e.message));
+        foresightExtractor.processBatch().catch((e) => log.warn('foresight:', e.message));
+      } catch (e) {
+        log.warn('recordAssistantTurn:', e.message);
       }
+    });
+  }
 
-      // 3. Forward to upstream — optionally disable thinking mode (Qwen3 etc.)
-      const rewritten = { ...parsed, messages: selectedMessages };
-      if (config.upstream.disableThinking) {
-        rewritten.chat_template_kwargs = { ...rewritten.chat_template_kwargs, enable_thinking: false };
-      }
-      const rewrittenBody = Buffer.from(JSON.stringify(rewritten));
-      let upRes;
-      try {
-        upRes = await forward(req, rewrittenBody);
-      } catch (err) {
-        console.error('[anamnesis] upstream error:', err.message);
-        res.writeHead(502);
-        return res.end(JSON.stringify({ error: err.message }));
-      }
+  // ─── Server ───────────────────────────────────────────────────────────────
 
-      // 4. Return response to client first
-      res.writeHead(upRes.status, upRes.headers);
-      res.end(upRes.body);
-
-      // 5. Store assistant turn + background extraction (non-blocking, after response sent)
-      if (!streaming) {
-        setImmediate(async () => {
-          try {
-            const upParsed = JSON.parse(upRes.body.toString());
-            const content  = upParsed.choices?.[0]?.message?.content ?? '';
-            if (content) {
-              const vec = await embedder.embed(content.slice(0, 2000)).catch(() => null);
-              const est = Math.ceil(content.length / config.context.charsPerToken);
-              history.insertTurn(sessionKey, 'assistant', content, vec, est);
-              // Trigger background extraction (memcells + foresights) — non-blocking
-              extractor.processBatch().catch(e =>
-                console.warn('[anamnesis] extractor:', e.message)
-              );
-              foresightExtractor.processBatch().catch(e =>
-                console.warn('[anamnesis] foresight:', e.message)
-              );
-            }
-          } catch { /* non-fatal */ }
-        });
-      }
-      return;
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/anamnesis/status') {
+      const stats = history.stats('default');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(
+        JSON.stringify({
+          status: 'ok',
+          ...stats,
+          upstream: config.upstream.baseUrl,
+          embedding_model: config.embedding.model,
+        })
+      );
     }
 
-    passthrough(req, res, rawBody);
+    const reqChunks = [];
+    req.on('data', (d) => reqChunks.push(d));
+    req.on('end', async () => {
+      const rawBody = Buffer.concat(reqChunks);
+
+      if (req.method === 'POST' && req.url.endsWith('/chat/completions')) {
+        let parsed;
+        try { parsed = JSON.parse(rawBody.toString()); }
+        catch { return passthrough(req, res, rawBody); }
+        if (!Array.isArray(parsed.messages)) return passthrough(req, res, rawBody);
+
+        const sessionKey = getSessionKey(req.headers, config.upstream.apiKey);
+        const streaming  = parsed.stream === true;
+
+        // 1. Persist user turn synchronously.
+        const userMsg = [...parsed.messages].reverse().find((m) => m.role === 'user');
+        if (userMsg?.content) {
+          const vec = await embedder.embed(userMsg.content).catch(() => null);
+          const est = Math.ceil(userMsg.content.length / config.context.charsPerToken);
+          history.insertTurn(sessionKey, 'user', userMsg.content, vec, est, embedder.model);
+        }
+
+        // 2. Scene-guided context selection.
+        let selectedMessages = parsed.messages;
+        try {
+          selectedMessages = await selector.select(sessionKey, parsed.messages);
+        } catch (err) {
+          log.error('selector error, falling back to original messages:', err.message);
+        }
+
+        // 3. Rewrite + forward.
+        const rewritten = { ...parsed, messages: selectedMessages };
+        if (config.upstream.disableThinking) {
+          rewritten.chat_template_kwargs = {
+            ...rewritten.chat_template_kwargs,
+            enable_thinking: false,
+          };
+        }
+        const rewrittenBody = Buffer.from(JSON.stringify(rewritten));
+        const headers = buildUpstreamHeaders(req.headers, { upstreamApiKey: config.upstream.apiKey });
+        headers['Content-Length'] = Buffer.byteLength(rewrittenBody);
+
+        if (streaming) {
+          const sse = makeSseAccumulator();
+          try {
+            await streamThrough(req.url, req.method, headers, rewrittenBody, res, (c) => sse.feed(c));
+          } catch (err) {
+            log.error('streaming upstream error:', err.message);
+            return;
+          }
+          recordAssistantTurn(sessionKey, sse.content);
+          return;
+        }
+
+        let upRes;
+        try { upRes = await bufferedForward(req.url, req.method, headers, rewrittenBody); }
+        catch (err) {
+          log.error('upstream error:', err.message);
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: err.message }));
+        }
+        res.writeHead(upRes.status, upRes.headers);
+        res.end(upRes.body);
+
+        try {
+          const upParsed = JSON.parse(upRes.body.toString());
+          const content  = upParsed.choices?.[0]?.message?.content ?? '';
+          recordAssistantTurn(sessionKey, content);
+        } catch { /* non-JSON response; nothing to persist */ }
+        return;
+      }
+
+      passthrough(req, res, rawBody);
+    });
   });
-});
 
-async function passthrough(req, res, body) {
-  try {
-    const upRes = await forward(req, body);
-    res.writeHead(upRes.status, upRes.headers);
-    res.end(upRes.body);
-  } catch (err) {
-    res.writeHead(502);
-    res.end(JSON.stringify({ error: err.message }));
+  async function passthrough(req, res, body) {
+    const headers = buildUpstreamHeaders(req.headers, { upstreamApiKey: config.upstream.apiKey });
+    headers['Content-Length'] = Buffer.byteLength(body);
+    try {
+      const upRes = await bufferedForward(req.url, req.method, headers, body);
+      res.writeHead(upRes.status, upRes.headers);
+      res.end(upRes.body);
+    } catch (err) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
   }
+
+  server.listen(config.proxy.port, config.proxy.host, () => {
+    log.info(`listening on ${config.proxy.host}:${config.proxy.port}`);
+    log.info(`upstream: ${config.upstream.baseUrl}`);
+    log.info(`extraction model: ${config.extraction.model}`);
+    log.info(
+      `token budget: ${config.context.tokenBudget} | recency: ${config.context.recencyTurns} turns | slots: ${config.context.rotatingSlots}`
+    );
+  });
+
+  let shuttingDown = false;
+  async function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log.info(`received ${signal}, shutting down gracefully...`);
+    consolidator.stop();
+    server.close();
+    await Promise.all([extractor.flushInFlight(), foresightExtractor.flushInFlight()]);
+    try { history.close(); } catch { /* already closed */ }
+    log.info('shutdown complete');
+    process.exit(0);
+  }
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT',  () => shutdown('SIGINT'));
+
+  return { server, history, shutdown };
 }
 
-server.listen(config.proxy.port, config.proxy.host, () => {
-  console.log(`[anamnesis] listening on ${config.proxy.host}:${config.proxy.port}`);
-  console.log(`[anamnesis] upstream: ${config.upstream.baseUrl}`);
-  console.log(`[anamnesis] extraction model: ${config.extraction.model}`);
-  console.log(`[anamnesis] token budget: ${config.context.tokenBudget} | recency: ${config.context.recencyTurns} turns | slots: ${config.context.rotatingSlots}`);
-});
+if (require.main === module) start();
 
-// ─── Graceful shutdown ───────────────────────────────────────────────────────
-async function shutdown(signal) {
-  console.log(`[anamnesis] received ${signal}, shutting down gracefully...`);
-  consolidator.stop();
-  server.close();
-  await Promise.all([
-    extractor.flushInFlight(),
-    foresightExtractor.flushInFlight(),
-  ]);
-  console.log('[anamnesis] shutdown complete');
-  process.exit(0);
-}
-
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT',  () => shutdown('SIGINT'));
+module.exports = { start, loadConfig };
