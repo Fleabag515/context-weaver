@@ -2,27 +2,34 @@
 
 *From Greek ἀνάμνησις — the deep recollection of what the mind already knows.*
 
-A self-organizing memory proxy for LLM agents. Inspired by [EverMemOS](https://arxiv.org/abs/2601.02163), Anamnesis gives Mark persistent, structured, intelligently-retrieved memory across unlimited context and sessions.
+A self-organizing memory proxy for LLM agents. Inspired by EverMemOS-style
+hierarchical memory (turn → memcell → memscene) with explicit foresight
+extraction, Anamnesis sits between any OpenAI-compatible client and any
+OpenAI-compatible backend and gives the model persistent, structured,
+intelligently-retrieved memory across unlimited context and sessions.
 
 ## Architecture
 
 ```
-OpenClaw ──→ Anamnesis :8084 ──→ llama-server :8083
-                 │
-                 ├── turns       (raw episodic trace, SQLite)
-                 ├── memcells    (atomic facts extracted by LLM)
-                 ├── memscenes   (thematic clusters, self-organizing)
-                 └── decay       (intelligent forgetting via score decay)
+client ──→ Anamnesis :8084 ──→ llama-server / Ollama / OpenAI / …
+              │
+              ├── turns       (raw episodic trace, SQLite)
+              ├── memcells    (atomic facts extracted by LLM)
+              ├── memscenes   (thematic clusters, self-organizing)
+              ├── foresights  (extracted future intentions)
+              └── decay       (intelligent forgetting via score decay)
 ```
 
-### Memory Pipeline
+### Memory pipeline
 
 ```
 Turn received
     │
-    ├─→ Store raw turn + embedding
+    ├─→ Store raw turn + embedding (sync, survives crashes)
     │
-    └─→ [background] MemCell extraction (gemma4:e2b)
+    └─→ [background] MemCell extraction       (extracted flag)
+              │
+              ├─→ Foresight scan in parallel  (foresight_scanned flag)
               │
               └─→ [periodic] MemScene consolidation
                       │
@@ -36,23 +43,24 @@ Query embedding
     │
     ├─→ Score all MemScenes by cosine similarity
     │       └─→ Expand top scenes → constituent turn IDs
-    │               └─→ Rank by sim + decay weight
+    │               └─→ Rank by sim + importance, fill budget
     │
     └─→ Fallback: raw turn similarity (no scenes yet)
 
 Final context window:
-  [ system ] + [ rotating relevant turns ] + [ last 8 turns verbatim ]
+  [ system + <memory> + <foresight> ] + [ rotating relevant turns ] + [ last N turns verbatim ]
 ```
 
 ## What makes this different from a sliding window
 
-| | Sliding window | Anamnesis |
-|---|---|---|
-| Old turns | Dropped permanently | Stored forever, retrieved when relevant |
-| Retrieval | Recency only | Scene-guided cosine similarity |
-| Memory structure | Flat | Hierarchical (turn → cell → scene) |
-| Forgetting | Hard cutoff | Soft decay by age + recall frequency |
-| Background processing | None | MemCell extraction + scene consolidation |
+|                       | Sliding window         | Anamnesis                              |
+|-----------------------|------------------------|----------------------------------------|
+| Old turns             | Dropped permanently    | Stored forever, retrieved when relevant |
+| Retrieval             | Recency only           | Scene-guided cosine similarity         |
+| Memory structure      | Flat                   | Hierarchical (turn → cell → scene)     |
+| Forgetting            | Hard cutoff            | Soft decay by age + recall frequency   |
+| Background processing | None                   | MemCell + Foresight extraction         |
+| Streaming             | Native                 | Native SSE pass-through                |
 
 ## Install
 
@@ -60,32 +68,74 @@ Final context window:
 sudo bash install.sh
 ```
 
-Then point OpenClaw's `llamaserver.baseUrl` to `http://127.0.0.1:8084/v1`.
+This installs an `anamnesis.service` systemd unit and starts it on port 8084.
+Point your OpenAI-compatible client's `baseUrl` at `http://127.0.0.1:8084/v1`.
+
+For a non-systemd run:
+
+```bash
+npm install
+node src/proxy.js
+# or, with watch reload:
+npm run dev
+```
 
 ## Config (`config.json`)
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `context.tokenBudget` | 65536 | Total token budget |
-| `context.recencyTurns` | 8 | Turn pairs always in context |
-| `context.rotatingSlots` | 6 | Old turns added via scene retrieval |
-| `extraction.model` | `gemma4:e2b` | Ollama model for MemCell extraction |
-| `memory.consolidationIntervalMs` | 120000 | How often scenes are rebuilt (ms) |
-| `memory.sceneClusterThreshold` | 0.72 | Cosine sim threshold for clustering |
-| `memory.decayPruneThreshold` | 0.05 | Score below which cells are pruned |
-| `history.maxAgeDays` | 90 | Raw turn retention |
+| Key                                | Default                       | Description                                  |
+|------------------------------------|-------------------------------|----------------------------------------------|
+| `proxy.port` / `proxy.host`        | `8084` / `127.0.0.1`          | Where Anamnesis listens                      |
+| `upstream.baseUrl`                 | `http://127.0.0.1:8083`       | Any OpenAI-compatible endpoint               |
+| `upstream.apiKey`                  | `localqwen`                   | Bearer token sent upstream. Empty = passthrough of client's own `Authorization` |
+| `upstream.disableThinking`         | `true`                        | Inject `chat_template_kwargs:{enable_thinking:false}` for Qwen3-style models |
+| `embedding.ollamaUrl` / `.model`   | `:11434` / `nomic-embed-cpu:latest` | Ollama embedding endpoint              |
+| `extraction.model`                 | `qwen3:0.6b`                  | Small LLM for memcell extraction             |
+| `foresight.model`                  | `qwen3:0.6b`                  | Small LLM for intention extraction           |
+| `context.tokenBudget`              | `65536`                       | Total token budget given to upstream         |
+| `context.recencyTurns`             | `8`                           | Turn pairs always in context, verbatim       |
+| `context.rotatingSlots`            | `6`                           | Old turns added via scene retrieval          |
+| `memory.consolidationIntervalMs`   | `120000`                      | How often scenes are rebuilt                 |
+| `memory.sceneClusterThreshold`     | `0.72`                        | Cosine sim threshold for clustering          |
+| `memory.decayPruneThreshold`       | `0.05`                        | Score below which non-critical cells are pruned |
+| `history.dbPath`                   | `~/.anamnesis/history.db`     | SQLite path; supports `~`, `$HOME`, `${HOME}` |
+| `history.maxAgeDays`               | `90`                          | Raw turn retention                            |
 
-## Status
+### Environment
+
+| Var              | Values                       | Notes                                |
+|------------------|------------------------------|--------------------------------------|
+| `ANAMNESIS_LOG`  | `error` / `warn` / `info` / `debug` | Default `info`. `debug` enables per-request selector tracing. |
+
+## Status endpoint
 
 ```
 GET http://127.0.0.1:8084/anamnesis/status
-→ { "status": "ok", "turns": 142, "cells": 831, "scenes": 24 }
+→ {
+    "status": "ok",
+    "turns": 142, "cells": 831, "scenes": 24, "foresights": 3,
+    "upstream": "http://127.0.0.1:8083",
+    "embedding_model": "nomic-embed-cpu:latest"
+  }
 ```
+
+## Development
+
+```bash
+npm test         # node:test suite over pure helpers
+npm run lint     # ESLint flat config
+npm run format   # Prettier --write
+```
+
+CI (`.github/workflows/ci.yml`) runs the same on every push.
 
 ## Roadmap
 
-- [ ] Streaming response storage
-- [ ] Foresight signals (predict likely future context needs)
+- [x] Streaming response storage (SSE pass-through + delta accumulation)
+- [x] Foresight signals (predict likely future context needs)
 - [ ] Cross-session scene merging
-- [ ] OpenClaw plugin wrapper
-- [ ] Web UI for browsing memory graph
+- [ ] Client plugin wrapper
+- [ ] Web UI for browsing the memory graph
+
+## License
+
+[MIT](./LICENSE)
