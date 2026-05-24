@@ -112,6 +112,23 @@ function forward(reqOpts, body) {
   });
 }
 
+
+// Safely extract plain text from a message content field.
+// OpenAI-compatible APIs allow content to be a string OR an array of
+// content parts ({type:'text',text:'...'} etc). SQLite only takes strings.
+function extractContentText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter(p => p?.type === 'text' || p?.text)
+      .map(p => p?.text ?? p?.content ?? '')
+      .join('\n')
+      .trim() || JSON.stringify(content);
+  }
+  if (content && typeof content === 'object') return JSON.stringify(content);
+  return String(content ?? '');
+}
+
 // ─── Server ──────────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   // Status endpoint
@@ -138,10 +155,12 @@ const server = http.createServer((req, res) => {
       // 1. Store user turn immediately (synchronous — survives shutdown)
       const userMsg = [...parsed.messages].reverse().find(m => m.role === 'user');
       if (userMsg?.content) {
+        // Normalise content — can be string or array of content parts
+        const userText = extractContentText(userMsg.content);
         // Embed async — if it fails, store without embedding
-        const vec = await embedder.embed(userMsg.content).catch(() => null);
-        const est = Math.ceil(userMsg.content.length / config.context.charsPerToken);
-        history.insertTurn(sessionKey, 'user', userMsg.content, vec, est);
+        const vec = await embedder.embed(userText.slice(0, 2000)).catch(() => null);
+        const est = Math.ceil(userText.length / config.context.charsPerToken);
+        history.insertTurn(sessionKey, 'user', userText, vec, est);
       }
 
       // 2. Scene-guided context selection

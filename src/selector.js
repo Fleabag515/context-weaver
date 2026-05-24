@@ -37,7 +37,13 @@ class Selector {
     const systemMsgs = incoming.filter(m => m.role === 'system');
     const convoMsgs  = incoming.filter(m => m.role !== 'system');
     const currentMsg = convoMsgs[convoMsgs.length - 1];
-    const queryText  = currentMsg?.content ?? '';
+    // content can be string or array of parts (multipart OpenAI messages)
+    const rawContent  = currentMsg?.content ?? '';
+    const queryText   = typeof rawContent === 'string'
+      ? rawContent
+      : Array.isArray(rawContent)
+        ? rawContent.filter(p => p?.type === 'text').map(p => p.text ?? '').join(' ').trim()
+        : JSON.stringify(rawContent);
 
     const queryVec = await this.embedder.embed(queryText);
 
