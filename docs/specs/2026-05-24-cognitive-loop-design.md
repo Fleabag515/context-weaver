@@ -1,11 +1,13 @@
 # Anamnesis v0.5.0 — Cognitive Loop
 
-**Status:** Draft v2 (revised after spec review)
+**Status:** Draft v3 (folds in reasoning-scaffold module)
 **Date:** 2026-05-24
 **Author:** Fleabag515 + Claude (design pair)
 **Targets:** v0.5.0
-**Builds on:** v0.4.0 persona system (`a74b390`) and the v0.3.0 audit pass.
-**Revision history:** v1 → v2 — addresses six reviewer issues (persona/lessons overlap, reward-signal math, allocation calibration, phase-independence rollback, benchmark methodology, structural gaps).
+**Builds on:** v0.4.0 persona system (`a74b390`), v0.3.0 audit pass, and the reasoning-proxy postmortem.
+**Revision history:**
+- v1 → v2 — addresses six reviewer issues (persona/lessons overlap, reward-signal math, allocation calibration, phase-independence rollback, benchmark methodology, structural gaps).
+- v2 → v3 — adds §7A Reasoning Scaffold (tier classification, plan injection, tool-result reflection) salvaged from the earlier reasoning-proxy experiment. Critique stage explicitly out-of-scope.
 
 ---
 
@@ -58,6 +60,10 @@ context window that's reassembled fresh each turn.
 - Co-exist cleanly with the v0.4.0 persona/character system. Persona owns
   agent self-knowledge; lessons own knowledge *about everything else*. The
   two are mutually exclusive by construction (see §5.6).
+- Salvage the working ideas from the reasoning-proxy experiment (tier
+  classification, plan injection, tool-result reflection) and integrate
+  them as a small "Reasoning Scaffold" module (§7A), without re-enabling
+  Qwen3 extended thinking.
 - Define a small benchmark suite that can demonstrate the "small model +
   Anamnesis ≈ large model alone" claim numerically — separate workstream,
   but in this spec because it justifies the design.
@@ -152,6 +158,7 @@ Targets:
 | Reward signal computation    | new            | `src/observer.js`             |
 | Hierarchical selector        | rewritten      | `src/selector.js`             |
 | Query-intent classifier      | new            | `src/lib/intent.js`           |
+| Reasoning scaffold (§7A)     | new            | `src/scaffold.js`             |
 | Persona drift hook           | unchanged      | `src/persona.js`              |
 | Telemetry endpoint additions | new            | `src/proxy.js`                |
 
@@ -536,6 +543,166 @@ Schema:
 This is what closes the loop — without it, the reward signal has
 nothing to credit or blame. Without the TTL/cap, it leaks.
 
+## 7A. Reasoning Scaffold
+
+### 7A.1 Why this is here
+
+An earlier experiment — the *reasoning-proxy* — sat between Anamnesis
+and llama-server doing **plan → draft → critique**. The idea was right:
+prompt the model to plan before answering, then have a second pass
+critique the draft. The implementation was wrong: it hard-overrode
+Anamnesis's `disableThinking: true` two ways (an `enable_thinking: true`
+override in `chat_template_kwargs` plus a `<|think_on|>` template-level
+injection), and Qwen3's reasoning budget shot to `2,147,483,647` tokens,
+eating the entire 65 K context window before any answer could start.
+First messages hit 44 K+ tokens and triggered immediate compaction.
+
+The salvageable parts — tier classification, plan injection, and
+tool-result reflection — fold cleanly into Anamnesis's existing
+proxy/selector pipeline without re-enabling thinking mode. They are
+included here because they make a small local model behave with the
+visible care of a larger one, which is the same goal as the rest of
+the Cognitive Loop.
+
+The cloud-critique stage is **deferred** (see §16). It added end-of-
+response latency, depended on an external service (`gemma4:31b-cloud`
+at ollama.com), and produced the "On reflection:" appended chunks that
+felt off in practice.
+
+### 7A.2 Three concerns, one module
+
+A new module `src/scaffold.js` exposes three pure-ish helpers:
+
+| Helper                     | Where called           | What it does                                                                  |
+| -------------------------- | ---------------------- | ----------------------------------------------------------------------------- |
+| `isTrivial(messages)`      | `proxy.js`, pre-selector | Returns true for short/casual messages. Trivial requests skip the entire memory pipeline AND the scaffold. |
+| `planBlock(intent)`        | `selector.js`, post-injection | Returns the planning instruction block, or empty string. Suppressed on `broad` intent. |
+| `toolReflectionBlock(messages)` | `proxy.js`, pre-forward  | If the last message is a tool result, returns the reflection instruction block. |
+
+All three are testable in isolation. None touch the DB.
+
+### 7A.3 Tier classification — `isTrivial(messages)`
+
+Lives **upstream of the selector**. If the last user message is trivial,
+the proxy skips selector, scaffold, and any LLM-side reasoning support
+and just forwards the request as-is. This is the critical latency win
+for "ok thanks" / "lol" / "👍" turns.
+
+Heuristic (v0.5.0 — deliberately simple):
+
+```js
+function isTrivial(messages) {
+  const last = messages[messages.length - 1];
+  if (!last) return false;
+  if (last.role !== 'user') return false;            // tool results, system, etc. are not trivial
+  const text = extractContentText(last.content);     // multipart-safe (see audit-pass)
+  if (text.length > 80) return false;
+  if (/\?/.test(text)) return false;                 // a question is not trivial
+  if (/^(ok|okay|k|thanks|thank you|cool|nice|👍|lol|haha|yes|no|sure|got it)\b/i.test(text)) return true;
+  return text.length <= 20;                          // very short non-question → trivial
+}
+```
+
+The heuristic is deliberately permissive: false negatives are cheap
+(an "ok thanks" that gets the full pipeline costs nothing extra),
+false positives are bad (a short but substantive question that
+skips memory injection is a regression). Tuned by the
+`scaffold.trivialMaxChars` and `scaffold.trivialMarkers` config keys.
+
+### 7A.4 Plan injection — `planBlock(intent)`
+
+Appended to the end of the system-message assembly, **after**
+`<character> + <lessons> + <memory> + <foresight>`. Empty string when
+disabled or for `broad` intent (avoids the persona-fight described in
+chat).
+
+#### PLAN_BLOCK (verbatim, pinned for v0.5.0)
+
+```
+
+<reasoning_policy>
+Before producing the final answer, in <think>:
+  1. Restate what's actually being asked.
+  2. List the sub-questions you need to resolve.
+  3. Identify tools to call, or note "no tools needed".
+  4. Anticipate what would make a naive answer wrong.
+  5. Sketch the answer's shape.
+
+Then produce the answer.
+</reasoning_policy>
+```
+
+Important: this asks the model to use `<think>` blocks in its output.
+Anamnesis's `disableThinking: true` setting suppresses Qwen3's
+*built-in* extended-thinking reasoning budget but does NOT prevent the
+model from emitting `<think>` blocks as ordinary output content when
+instructed to do so. This is the lesson from the reasoning-proxy
+postmortem: behavioural prompting and `enable_thinking` are
+*different things* and must not be conflated.
+
+The `disableThinking` config remains `true`. Plan injection rides on
+behavioural prompting only.
+
+### 7A.5 Tool-result reflection — `toolReflectionBlock(messages)`
+
+When the last message in the request is a tool result (`role === 'tool'`),
+append a reflection block to the system message before forwarding:
+
+#### TOOL_REFLECTION_BLOCK (verbatim, pinned for v0.5.0)
+
+```
+
+<tool_reflection>
+A tool just returned a result. Before continuing:
+  - Did the tool result actually answer the sub-question you were resolving?
+  - If partial or unhelpful: what's the next step? Another tool call,
+    a different query, or admit the gap?
+</tool_reflection>
+```
+
+This is the smallest of the three changes and has the lowest variance
+in behaviour — but in long agentic loops where Mark chains many tool
+calls, it noticeably reduces "the tool returned junk and the model
+pretended it was an answer" failures.
+
+### 7A.6 Interaction with the cognitive-loop selector
+
+```
+proxy receives request
+  ↓
+  isTrivial(lastUserMessage) ?
+    yes → passthrough: forward as-is. No selector. No scaffold.
+                       No memory injection.
+    no  → selector.select(): assemble <character>+<lessons>+<memory>+<foresight>
+        → planBlock(intent): appended unless intent === "broad"
+        → toolReflectionBlock(messages): appended if last msg is a tool result
+        → forward to upstream
+        → observer fires post-response (reward / drift / foresight closure)
+```
+
+The scaffold runs *inside* the non-trivial path, *between* selector and
+upstream forwarding. The reward signal (§6) does not directly score the
+scaffold blocks — they're behavioural prompts, not memory items — but
+the scaffold makes the model behave in a way that's easier for the echo
+signal to credit (clearer drafts cite their inputs more visibly).
+
+### 7A.7 Why critique stays deferred
+
+Cloud-mediated post-draft critique is *interesting* but:
+
+- Adds end-of-response latency (a second LLM call) on every non-trivial
+  request.
+- Introduces a hard external-service dependency (the v0.4.0 install
+  doesn't have one).
+- Produces "On reflection:" appended chunks that read as awkward.
+- Could be done locally with `qwen3:0.6b` instead, removing the cloud
+  dep — but then it's competing with the foresight extractor and
+  reward observer for the same small model.
+
+v0.6.0 may revisit critique with a **local** small-model implementation
+gated on `intent = "reflective"` only. v0.5.0 keeps the surface area
+small.
+
 ## 8. Data Model Changes
 
 ### 8.1 New tables
@@ -594,6 +761,19 @@ flags.
       "narrow":     { "lessons": 0.25, "scenes": 0.25, "memcells": 0.25, "turns": 0.25 },
       "reflective": { "lessons": 0.25, "scenes": 0.25, "memcells": 0.25, "turns": 0.25 }
     }
+  },
+  "scaffold": {
+    "_note": "Reasoning scaffold — tier classification + plan + tool-reflection. Critique deferred.",
+    "trivialEnabled": true,
+    "trivialMaxChars": 80,
+    "trivialMarkers": ["ok", "okay", "k", "thanks", "thank you", "cool", "nice", "lol", "haha", "yes", "no", "sure", "got it"],
+    "plan": {
+      "enabled": true,
+      "skipOnIntent": ["broad"]
+    },
+    "toolReflection": {
+      "enabled": true
+    }
   }
 }
 ```
@@ -601,6 +781,13 @@ flags.
 When `cognitive.lessons.enabled = false`, the selector falls back to
 the v0.4.0 logic exactly (no lesson tier, single rotating-turn pool).
 This is the rollback path.
+
+The scaffold block has its own independent flags. Setting
+`scaffold.plan.enabled = false` disables plan injection but leaves
+tier classification (the latency win) active, and vice-versa. Both
+default to `true`. The reasoning-proxy postmortem informs the
+defaults: do tier classification always, plan-inject everywhere
+except `broad` intent, never re-enable upstream thinking mode.
 
 ## 10. Observability
 
@@ -661,6 +848,12 @@ the audit pass tightened in v0.3.0.
 - `selector.test.js` (rewritten) — allocations math, manifest
   construction including TTL/eviction, exploration bonus monotonicity,
   fallback when `cognitive.lessons.enabled = false`.
+- `scaffold.test.js` (new — reasoning scaffold) — `isTrivial` matches
+  against a ~30-item table covering English casuals, emoji, questions,
+  multipart content; `planBlock` returns empty for `broad` intent and
+  the verbatim prompt for `narrow`/`reflective`; `toolReflectionBlock`
+  fires only when last message role is `tool`; integration test
+  confirms the proxy short-circuits before the selector on trivial.
 
 ### 11.2 Integration tests
 
@@ -688,7 +881,7 @@ conversations and a real Ollama; produces a JSON report.
 
 | Phase | Scope                                                                                            | Default flag state                                      |
 | ----- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------- |
-| α     | Schema migration, distiller generates lessons in background, **no injection** yet.               | `lessons.enabled=true` (silent population)              |
+| α     | Schema migration, distiller generates lessons in background, **no injection** yet. **Reasoning scaffold (tier classification + plan injection + tool-reflection) ships in α** — it has no DB footprint and decouples from the rest of the cognitive loop. | `lessons.enabled=true` (silent population); `scaffold.*` defaults from §9 |
 | β     | Selector reads lessons tier under `reflective` intent only. Reward EMA observed but **not written**. | `selector.intent.mode=heuristic`                        |
 | γ     | Selector reads lessons across all intents. Reward write-back to `lessons.precision_score` and `memscenes.injection_score` (NEW columns only).  | `reward.enabled=true`, `reward.writebackLegacyImportance=false` |
 | 1.0   | Full reward write-back including `memcells.importance` (legacy). Refutation loop active. Intent classifier optionally `llm` mode. Production allocations from bench. | `reward.writebackLegacyImportance=true`                 |
@@ -781,6 +974,9 @@ what we'd link in a blog post or arXiv preprint.
 | Persona / lessons accidentally overlap.                                    | LESSON_PROMPT scope clause; agent-scope rejection test in `distiller.test.js`; overlap is treated as a refutation event. |
 | Positive feedback loop reinforces injected lessons forever.                | Mean-reversion of `precision_score` toward 0.5; exploration bonus in selector; idle retire.                              |
 | Manifest map leaks memory.                                                 | 5-min TTL + 10K hard cap + 60s sweep (§7.5).                                                                            |
+| Plan injection fights persona voice (structured 5-step output on a casual question). | `scaffold.plan.skipOnIntent` excludes `broad` by default (§7A.4). Persona drift check still observes; if drift spikes, ops bumps `skipOnIntent` to include `narrow`. |
+| `isTrivial` false-positive routes a substantive short question to passthrough (no memory). | Heuristic is conservative (questions are never trivial; markers list is opt-in); `scaffold.trivialEnabled=false` is the kill switch; bench harness includes a "short-question recall" task to catch regressions. |
+| Reasoning-proxy regression — someone re-enables Qwen3 extended thinking via a config drift. | Spec §7A.4 explicitly notes `disableThinking` stays `true`. Plan injection is behavioural prompting only; never touches `chat_template_kwargs.enable_thinking` or `<\|think_on\|>` template triggers. A unit test asserts the rewritten request body never contains those tokens. |
 
 ## 15. Backward Compatibility Invariants
 
@@ -818,6 +1014,14 @@ status endpoint contains all old fields.
 - Auto-tuning allocations per session (v0.6.0 experiment).
 - Latency-as-reward (deferred indefinitely — bidirectional signal).
 - Multilingual correction-marker dictionaries.
+- Cloud-mediated post-draft critique (§7A.7). Possible v0.6.0 with a
+  local small model gated to `reflective` intent.
+- Qwen3 `<think>` content extraction / `reasoning_content` preservation
+  across turns. Only relevant if `disableThinking` is ever flipped to
+  `false`; v0.5.0 keeps it `true` and the scaffold rides on behavioural
+  prompts instead.
+- Multilingual trivial-marker lists (`scaffold.trivialMarkers` is
+  English-only in v0.5.0).
 
 ## 17. Resolved Open Questions (was §16 in v1)
 
@@ -840,6 +1044,10 @@ status endpoint contains all old fields.
 - **injection manifest** — per-request record of what was injected, used by the observer. TTL'd (§7.5).
 - **precision_score** — EMA of reward signal per lesson; gates further use.
 - **intent** — `broad | narrow | reflective`, drives budget allocation.
+- **trivial** — `isTrivial(messages)` is true for short/casual user messages. Trivial requests bypass the selector, the scaffold, and all memory injection. (§7A.3)
+- **plan block** — behavioural prompt appended to the system message asking the model to plan inside `<think>` before answering. Suppressed on `broad` intent. (§7A.4)
+- **tool reflection block** — behavioural prompt appended when the last message is a tool result, asking the model to evaluate whether the result actually resolved the sub-question. (§7A.5)
+- **reasoning scaffold** — the umbrella name for tier classification + plan injection + tool-result reflection. Lives in `src/scaffold.js`. (§7A)
 
 ---
 
@@ -876,3 +1084,14 @@ At merge time it moves to `docs/launch/v0.5.0.md` for the release post.
 | Decay units                                          | §5.5 — "All decay timescales are in days"                             |
 | Embed off what                                       | §5.2, §17 — content only                                              |
 | Appendix A in spec                                   | Marked for relocation to `docs/launch/v0.5.0.md`                      |
+
+## Appendix C — Reasoning-proxy postmortem mapping (v2 → v3)
+
+| Reasoning-proxy concern              | Where folded in / outcome                                                                                       |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| Tier classification (trivial path)   | §7A.3 — `isTrivial()` in `src/scaffold.js`, gated upstream of selector.                                         |
+| Plan injection                       | §7A.4 — `planBlock(intent)` appended after `<character>+<lessons>+<memory>+<foresight>`; PLAN_BLOCK pinned.    |
+| Tool-result reflection               | §7A.5 — `toolReflectionBlock(messages)` fires when last message role is `tool`; TOOL_REFLECTION_BLOCK pinned.   |
+| Thinking-mode override / `<\|think_on\|>` | Explicitly forbidden (§7A.4 + §14 risk row). Unit test asserts no thinking-mode tokens leak into the upstream request body. |
+| Cloud-mediated critique              | Deferred (§7A.7, §16). v0.6.0 may revisit with a local small model.                                            |
+| `reasoning_content` preservation     | Deferred (§16). Only relevant if `disableThinking` is ever flipped off.                                         |
