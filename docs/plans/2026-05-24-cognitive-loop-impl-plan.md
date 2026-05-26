@@ -2001,5 +2001,1191 @@ as the distiller pulls clusters.
 
 ---
 
-**End of Chunk 1 (Phase α).** Reviewer dispatches next.
+**End of Chunk 1 (Phase α).**
+
+---
+
+## Chunk 2: Phase β — Lesson injection (reflective only) + Observer (read-only)
+
+**Phase β exit criteria (from spec §12):**
+
+- New module `src/lib/intent.js` exists with a heuristic classifier
+  returning `"broad" | "narrow" | "reflective"`.
+- Selector retrieves lessons and injects a `<lessons>` block, **but only
+  when intent classifies as `reflective`**. Other intents see unchanged
+  v0.4.0 + scaffold behaviour.
+- New module `src/observer.js` exists and is wired post-turn in
+  `proxy.js`. It computes the three reward signals (echo-debiased,
+  no-correction, foresight-closure) and **logs an EMA at `info` level
+  per turn**. NO database write-back yet (`cognitive.reward.enabled=true`
+  but a `reward.observeOnly=true` flag prevents writes).
+- `src/lib/manifest.js` implements the per-request injection manifest
+  with 5-min TTL and 10K cap (§7.5).
+- Status endpoint reports `intent_mix` and `reward_ema`.
+- INTENT_PROMPT verbatim from §7.4, pinned by test mirroring Task 10.
+- All Chunk 1 tests still green; full suite green; lint/format clean.
+- v0.4.0 client behaviour: still unchanged. (β touches the selector
+  only when intent=reflective; v0.4.0 clients are usually `narrow`.)
+
+**Chunk 2 file plan:**
+
+| File                          | Action | Why                                                          |
+| ----------------------------- | ------ | ------------------------------------------------------------ |
+| `src/lib/intent.js`           | create | Heuristic + `llm` (opt-in) classifier; INTENT_PROMPT verbatim. |
+| `src/lib/manifest.js`         | create | Bounded map with TTL + cap + sweep.                         |
+| `src/reward.js`               | create | Three pure signal functions + ensemble math.                |
+| `src/observer.js`             | create | Post-turn router: reward + persona + foresight in one place. |
+| `src/selector.js`             | modify | Lesson retrieval scoped to `reflective` intent; returns manifest. |
+| `src/proxy.js`                | modify | Wire intent.classify + observer post-response; pass manifest. |
+| `test/intent.test.js`         | create | Heuristic table; INTENT_PROMPT pin test.                    |
+| `test/manifest.test.js`       | create | TTL + cap + sweep semantics.                                |
+| `test/reward.test.js`         | create | Each signal in isolation + ensemble.                        |
+| `test/observer.test.js`       | create | Dispatch order; observe-only flag; per-item credit.         |
+| `test/selector.test.js`       | modify | Reflective-only injection; manifest emission; non-reflective unchanged. |
+
+---
+
+### Task β.1: `src/lib/intent.js` — heuristic classifier + INTENT_PROMPT constant
+
+**Files:** Create `src/lib/intent.js`, `test/intent.test.js`.
+
+- [ ] **Step 1: Write the table-driven test** in `test/intent.test.js`:
+
+```javascript
+const test   = require('node:test');
+const assert = require('node:assert/strict');
+const { classifyHeuristic } = require('../src/lib/intent.js');
+
+const cases = [
+  // narrow — specific recall
+  ['what was the exact command?', 'narrow'],
+  ['what file did we put the migration in?', 'narrow'],
+  ['/home/fleabag/anamnesis/src/proxy.js line 142?', 'narrow'],
+  ['when did we ship v0.4.0?', 'narrow'],
+
+  // broad — exploratory / planning
+  ['help me think about how to deploy this', 'broad'],
+  ['what are some ideas for the next milestone?', 'broad'],
+  ['ok lets brainstorm features', 'broad'],
+
+  // reflective — meta / cross-conversation
+  ['what have we learned about the user this week?', 'reflective'],
+  ['summarise our decisions about auth across all sessions', 'reflective'],
+  ['why do I keep coming back to this pattern in general?', 'reflective'],
+  ['overall, what is the right approach?', 'reflective'],
+
+  // edges
+  ['',          'narrow'],   // empty defaults to narrow (most conservative for selector)
+  ['👍',        'narrow'],   // emoji defaults to narrow
+];
+
+for (const [text, expected] of cases) {
+  test(`classifyHeuristic("${text.slice(0, 40)}") === ${expected}`, () => {
+    assert.equal(classifyHeuristic(text), expected);
+  });
+}
+```
+
+- [ ] **Step 2:** Run; expect `Cannot find module '../src/lib/intent.js'`.
+
+- [ ] **Step 3:** Implement `src/lib/intent.js`:
+
+```javascript
+/**
+ * lib/intent.js — query-intent classifier. Spec §7.4.
+ *
+ * Two modes:
+ *   - classifyHeuristic(text)    — rule-based, zero LLM calls. Default.
+ *   - classifyLLM(text, ollamaUrl, model) — one tiny LLM call (~80ms).
+ *     Opt-in via cognitive.selector.intent.mode = "llm".
+ *
+ * Both return one of "broad" | "narrow" | "reflective".
+ */
+
+const { chat } = require('./ollama.js');
+
+const REFLECTIVE_MARKERS = [
+  /\bwhat (have|did) we learn/i, /\bin general\b/i, /\boverall\b/i,
+  /\bsummari[sz]e\b/i, /\bacross (all|sessions|conversations)\b/i,
+  /\bwhy do (i|you) keep\b/i, /\bpattern(s)?\b/i,
+];
+
+const NARROW_MARKERS = [
+  /\bexact\b/i, /\bwhich file\b/i, /\bwhich line\b/i, /\bwhen did\b/i,
+  /\/[\w./-]+\b/,                          // file paths
+  /\b[a-z_]+\.[a-z_]+\(\)/i,               // function calls
+  /\bv\d+\.\d+(\.\d+)?\b/,                 // version refs
+  /\b\d{4}-\d{2}-\d{2}\b/,                 // ISO dates
+];
+
+const BROAD_MARKERS = [
+  /\b(help me|let'?s) (think|brainstorm|figure out|plan|design)\b/i,
+  /\bideas\b/i, /\bbrainstorm\b/i, /\bapproach(es)?\b/i,
+  /\bshould we\b/i,
+];
+
+function classifyHeuristic(text) {
+  const t = (text || '').trim();
+  if (!t) return 'narrow';
+
+  // Reflective trumps broad trumps narrow when markers fire.
+  if (REFLECTIVE_MARKERS.some((r) => r.test(t))) return 'reflective';
+  if (BROAD_MARKERS.some((r) => r.test(t))) return 'broad';
+  if (NARROW_MARKERS.some((r) => r.test(t))) return 'narrow';
+
+  // Fallback by shape: question with no markers → narrow; statement → broad.
+  if (/\?/.test(t)) return 'narrow';
+  return t.split(/\s+/).length > 8 ? 'broad' : 'narrow';
+}
+
+const INTENT_PROMPT = `Classify the user's query into exactly one of three intent categories.
+Output ONLY one word: "broad", "narrow", or "reflective".
+
+  broad      — open-ended, exploratory, asking about a topic in general,
+               asking for ideas, asking for plans
+  narrow     — specific, pointed, asking for a value, a fact, a command,
+               a name, a date, a file path, exact recall
+  reflective — meta, retrospective, asking what we've learned, asking
+               for synthesis across many past conversations, asking the
+               agent to comment on a pattern
+
+QUERY:
+`;
+
+async function classifyLLM(text, ollamaUrl, model = 'qwen3:0.6b') {
+  try {
+    const reply = await chat(ollamaUrl, {
+      model,
+      messages: [{ role: 'user', content: INTENT_PROMPT + text }],
+      options: { temperature: 0.0, num_predict: 8 },
+      timeoutMs: 5000,
+    });
+    const w = String(reply || '').trim().toLowerCase();
+    if (w.startsWith('reflective')) return 'reflective';
+    if (w.startsWith('broad')) return 'broad';
+    if (w.startsWith('narrow')) return 'narrow';
+  } catch { /* fall through */ }
+  return classifyHeuristic(text);
+}
+
+async function classify(text, cfg = {}) {
+  const mode = cfg.mode || 'heuristic';
+  if (mode === 'llm') return classifyLLM(text, cfg.ollamaUrl, cfg.model);
+  return classifyHeuristic(text);
+}
+
+module.exports = { classify, classifyHeuristic, classifyLLM, INTENT_PROMPT };
+```
+
+- [ ] **Step 4:** Run; expect all heuristic cases green.
+
+- [ ] **Step 5:** Commit:
+
+```bash
+npm run format && npm run lint
+git add src/lib/intent.js test/intent.test.js
+git commit -m "feat(intent): heuristic + opt-in LLM classifier (§7.4)
+
+Heuristic uses three small marker lists (reflective/narrow/broad) with
+deterministic precedence: reflective > broad > narrow. LLM mode falls
+back to heuristic on timeout/error."
+```
+
+---
+
+### Task β.2: Pin INTENT_PROMPT byte-identical to spec §7.4
+
+**Files:** `test/intent.test.js`.
+
+Same shape as Chunk 1 Task 10 (LESSON_PROMPT pin). Append to
+`test/intent.test.js`:
+
+```javascript
+const fs = require('node:fs');
+const path = require('node:path');
+
+test('INTENT_PROMPT: byte-identical to spec §7.4', () => {
+  const { INTENT_PROMPT } = require('../src/lib/intent.js');
+  const specPath = path.join(__dirname, '..', 'docs', 'specs', '2026-05-24-cognitive-loop-design.md');
+  const spec = fs.readFileSync(specPath, 'utf8');
+  const m = spec.match(/INTENT_PROMPT \(verbatim, pinned for v0\.5\.0\)\s*\n+\s*```\n([\s\S]*?)\n```/);
+  assert.ok(m, 'spec must contain the INTENT_PROMPT fenced block');
+  const norm = (s) => s.replace(/\s+$/, '');
+  assert.equal(norm(INTENT_PROMPT), norm(m[1]),
+    'INTENT_PROMPT in intent.js has drifted from spec §7.4');
+});
+```
+
+- [ ] Run, expect pass. Commit:
+
+```bash
+git add test/intent.test.js
+git commit -m "test(intent): pin INTENT_PROMPT byte-identical to spec §7.4"
+```
+
+---
+
+### Task β.3: `src/lib/manifest.js` — bounded map with TTL + cap
+
+**Files:** Create `src/lib/manifest.js`, `test/manifest.test.js`.
+
+Per spec §7.5: per-entry TTL 300s, hard cap 10K, sweep every 60s.
+
+- [ ] **Step 1: Tests**
+
+```javascript
+const test   = require('node:test');
+const assert = require('node:assert/strict');
+const ManifestStore = require('../src/lib/manifest.js');
+
+test('store + get within TTL', () => {
+  const m = new ManifestStore({ ttlMs: 1000, capacity: 100 });
+  m.put('req-1', { items: [{ kind: 'lesson', id: 7 }] });
+  assert.equal(m.get('req-1').items[0].id, 7);
+});
+
+test('TTL: entry expires after ttlMs', async () => {
+  const m = new ManifestStore({ ttlMs: 20, capacity: 100 });
+  m.put('req-1', { items: [] });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(m.get('req-1'), null);
+});
+
+test('cap: oldest-first eviction when over capacity', () => {
+  const m = new ManifestStore({ ttlMs: 60_000, capacity: 3 });
+  m.put('a', { v: 1 });
+  m.put('b', { v: 2 });
+  m.put('c', { v: 3 });
+  m.put('d', { v: 4 });   // evicts 'a'
+  assert.equal(m.get('a'), null);
+  assert.equal(m.get('d').v, 4);
+});
+
+test('sweep clears expired entries', async () => {
+  const m = new ManifestStore({ ttlMs: 20, capacity: 100 });
+  m.put('x', {});
+  await new Promise((r) => setTimeout(r, 30));
+  m.sweep();
+  assert.equal(m.size(), 0);
+});
+
+test('takeAndRemove returns + deletes', () => {
+  const m = new ManifestStore({ ttlMs: 1000, capacity: 100 });
+  m.put('a', { v: 1 });
+  assert.equal(m.takeAndRemove('a').v, 1);
+  assert.equal(m.get('a'), null);
+});
+```
+
+- [ ] **Step 2:** Run, expect fails.
+
+- [ ] **Step 3: Implement** `src/lib/manifest.js`:
+
+```javascript
+/**
+ * lib/manifest.js — bounded in-memory store for per-request injection
+ * manifests. Spec §7.5.
+ *
+ * Insertion-ordered (Map preserves insertion order). On overflow, evicts
+ * oldest first. Entries expire after ttlMs; sweep() removes expired
+ * entries. The proxy calls sweep on a 60s setInterval.
+ */
+class ManifestStore {
+  constructor({ ttlMs = 300_000, capacity = 10_000 } = {}) {
+    this.ttlMs = ttlMs;
+    this.capacity = capacity;
+    this.m = new Map(); // id → { createdAt, payload }
+  }
+
+  put(id, payload) {
+    if (this.m.size >= this.capacity) {
+      // Map preserves insertion order; first key is the oldest.
+      const oldest = this.m.keys().next().value;
+      if (oldest !== undefined) this.m.delete(oldest);
+    }
+    this.m.set(id, { createdAt: Date.now(), payload });
+  }
+
+  get(id) {
+    const e = this.m.get(id);
+    if (!e) return null;
+    if (Date.now() - e.createdAt > this.ttlMs) {
+      this.m.delete(id);
+      return null;
+    }
+    return e.payload;
+  }
+
+  takeAndRemove(id) {
+    const p = this.get(id);
+    if (p) this.m.delete(id);
+    return p;
+  }
+
+  sweep() {
+    const now = Date.now();
+    for (const [id, e] of this.m) {
+      if (now - e.createdAt > this.ttlMs) this.m.delete(id);
+    }
+  }
+
+  size() { return this.m.size; }
+}
+
+module.exports = ManifestStore;
+```
+
+- [ ] **Step 4:** Run, expect all pass.
+
+- [ ] **Step 5:** Commit:
+
+```bash
+npm run format && npm run lint
+git add src/lib/manifest.js test/manifest.test.js
+git commit -m "feat(manifest): bounded TTL store for injection manifests (§7.5)"
+```
+
+---
+
+### Task β.4: Reward signal — echo (debiased)
+
+**Files:** Create `src/reward.js`, `test/reward.test.js`.
+
+Per spec §6.3: per-item echo = `cos(response, item) − cos(response, query)`.
+This strips the topic-confound — the v1 spec's plain cosine signal was
+mostly capturing "the response talks about the same topic as the query",
+not utility.
+
+- [ ] **Step 1: Tests**
+
+```javascript
+const test   = require('node:test');
+const assert = require('node:assert/strict');
+const reward = require('../src/reward.js');
+
+function vec(arr) { return new Float32Array(arr); }
+
+test('echoDebiased: item leaned on > query baseline → positive', () => {
+  const response = vec([0.0, 1.0, 0.0]);
+  const query    = vec([1.0, 0.0, 0.0]);
+  const item     = vec([0.0, 0.9, 0.1]);  // aligned with response, not query
+  const r = reward.echoDebiased(response, query, item);
+  assert.ok(r > 0.5, `expected r > 0.5, got ${r}`);
+});
+
+test('echoDebiased: item just topical with query → near zero', () => {
+  const response = vec([0.5, 0.5, 0.0]);
+  const query    = vec([1.0, 0.0, 0.0]);
+  const item     = vec([1.0, 0.0, 0.0]);  // same as query
+  const r = reward.echoDebiased(response, query, item);
+  // cos(resp, item) ≈ cos(resp, query) — should debias to near 0.
+  assert.ok(Math.abs(r) < 0.1, `expected ≈ 0, got ${r}`);
+});
+
+test('echoDebiased: null vectors → 0', () => {
+  assert.equal(reward.echoDebiased(null, vec([1]), vec([1])), 0);
+  assert.equal(reward.echoDebiased(vec([1]), null, vec([1])), 0);
+});
+
+test('echoDebiased: clamped to [-1, 1]', () => {
+  const v = vec([1, 0]);
+  const opp = vec([-1, 0]);
+  const r = reward.echoDebiased(v, opp, v);   // cos(v,v)=1, cos(v,opp)=-1, diff=2
+  assert.ok(r >= -1 && r <= 1);
+});
+```
+
+- [ ] **Step 2:** Run, expect `Cannot find module './reward'`.
+
+- [ ] **Step 3: Implement skeleton**
+
+```javascript
+/**
+ * reward.js — three signal computations + ensemble. Spec §6.
+ *
+ * All functions are pure; no DB, no HTTP. Caller (observer.js) wires the
+ * signals into per-turn write-back.
+ */
+
+const Embedder = require('./embedder.js');
+
+function echoDebiased(responseVec, queryVec, itemVec) {
+  if (!responseVec || !queryVec || !itemVec) return 0;
+  const a = Embedder.cosine(responseVec, itemVec);
+  const b = Embedder.cosine(responseVec, queryVec);
+  return Math.max(-1, Math.min(1, a - b));
+}
+
+module.exports = { echoDebiased };
+```
+
+- [ ] **Step 4:** Run, expect pass.
+
+- [ ] **Step 5:** Commit:
+
+```bash
+npm run format && npm run lint
+git add src/reward.js test/reward.test.js
+git commit -m "feat(reward): echoDebiased signal (§6.3)
+
+Subtracts cos(response, query) baseline so the score reflects items the
+response leaned on BEYOND what the query already covered. Replaces the
+naïve plain-cosine echo flagged by the v1→v2 spec review."
+```
+
+---
+
+### Task β.5: Reward — no-correction (weighted by prior echo)
+
+**Files:** Modify `src/reward.js`, `test/reward.test.js`.
+
+Per §6.3: blame on the *next* user turn weighted by `prev_echo / sum(prev_echo)`
+— the item that was actually used eats the blame.
+
+- [ ] **Step 1: Tests**
+
+```javascript
+test('noCorrection: detects correction markers', () => {
+  assert.equal(reward.detectCorrection('no, I told you it is X'), true);
+  assert.equal(reward.detectCorrection('actually that is wrong'), true);
+  assert.equal(reward.detectCorrection('Actually...'), true);
+  assert.equal(reward.detectCorrection("I said X earlier"), true);
+  assert.equal(reward.detectCorrection('thanks, that works'), false);
+  assert.equal(reward.detectCorrection(''), false);
+});
+
+test('correctionBlame: weights blame by prior echo', () => {
+  const prevEchos = [0.9, 0.1, 0.0];  // item 0 was leaned on
+  const blames = reward.correctionBlame(prevEchos);
+  assert.equal(blames.length, 3);
+  // Item with high prior echo eats most blame.
+  assert.ok(blames[0] < -0.5);
+  assert.ok(blames[1] > -0.2);
+  // All zero echos → zero blame across the board (no information).
+  assert.deepEqual(reward.correctionBlame([0, 0, 0]), [0, 0, 0]);
+});
+```
+
+- [ ] **Step 2:** Run, expect fail.
+
+- [ ] **Step 3: Implement** — append to `src/reward.js`:
+
+```javascript
+const CORRECTION_RE = /\b(no|actually|that'?s wrong|I (told|said) you|wrong)\b/i;
+
+function detectCorrection(nextUserText) {
+  if (!nextUserText) return false;
+  return CORRECTION_RE.test(nextUserText);
+}
+
+/**
+ * Given the previous turn's per-item echo signals, return per-item blame
+ * weights in [-1, 0]. Item with highest prior echo eats most blame.
+ * Returns all-zeros if every prior echo is zero (no signal).
+ */
+function correctionBlame(prevEchos) {
+  const total = prevEchos.reduce((s, e) => s + Math.max(0, e), 0);
+  if (total <= 0) return prevEchos.map(() => 0);
+  return prevEchos.map((e) => -Math.max(0, e) / total);
+}
+
+module.exports.detectCorrection = detectCorrection;
+module.exports.correctionBlame = correctionBlame;
+```
+
+- [ ] **Step 4:** Run, expect pass.
+
+- [ ] **Step 5:** Commit:
+
+```bash
+git add src/reward.js test/reward.test.js
+git commit -m "feat(reward): no-correction signal with per-item blame weighting (§6.3)
+
+Items that were actually leaned on (high prior echo) eat most of the
+blame when the next user turn signals a correction. Flat blame across
+all injections was the v1 design flaw the reviewer caught."
+```
+
+---
+
+### Task β.6: Reward — foresight closure signal
+
+**Files:** Modify `src/reward.js`, `test/reward.test.js`.
+
+Per §6.3: if a previously-open foresight was fulfilled this turn, items
+semantically related to the foresight target gain. A semantic-relatedness
+gate (`cos(itemVec, foresightVec) ≥ 0.55`) prevents rewarding incidental
+injections.
+
+- [ ] **Step 1: Tests**
+
+```javascript
+test('foresightCredit: rewards items near the fulfilled foresight', () => {
+  const fVec    = vec([1, 0, 0]);
+  const items   = [vec([0.95, 0.05, 0]), vec([0, 1, 0])];
+  const credits = reward.foresightCredit(fVec, items);
+  assert.ok(credits[0] > 0.4);
+  assert.equal(credits[1], 0);
+});
+
+test('foresightCredit: empty inputs → zero array', () => {
+  assert.deepEqual(reward.foresightCredit(null, [vec([1])]), [0]);
+});
+```
+
+- [ ] **Step 2 → 5:** Implement, run, commit:
+
+```javascript
+function foresightCredit(foresightVec, itemVecs, threshold = 0.55) {
+  if (!foresightVec) return (itemVecs || []).map(() => 0);
+  return itemVecs.map((iv) => {
+    if (!iv) return 0;
+    const s = Embedder.cosine(foresightVec, iv);
+    return s >= threshold ? s : 0;
+  });
+}
+
+module.exports.foresightCredit = foresightCredit;
+```
+
+```bash
+npm run format && npm run lint
+git add src/reward.js test/reward.test.js
+git commit -m "feat(reward): foresightCredit signal — relatedness-gated bonus (§6.3)"
+```
+
+---
+
+### Task β.7: Reward — ensemble + observe-only write path
+
+**Files:** Modify `src/reward.js`, `test/reward.test.js`.
+
+The ensemble combines `echo`, `correction`, `foresight` per `cognitive.reward.weights`.
+
+- [ ] **Step 1: Tests**
+
+```javascript
+test('ensemble: weighted sum, clamped to [-1, 1]', () => {
+  const r = reward.ensemble({ echo: 0.5, correction: -0.2, foresight: 0.7 },
+                            { echo: 0.6, correction: 0.25, foresight: 0.15 });
+  // 0.5*0.6 + -0.2*0.25 + 0.7*0.15 = 0.3 + -0.05 + 0.105 = 0.355
+  assert.ok(Math.abs(r - 0.355) < 1e-6);
+});
+
+test('emaUpdate: smoothing factor 0.1', () => {
+  // new_ema = old + α(reward - old)
+  assert.ok(Math.abs(reward.emaUpdate(0.5, 1.0, 0.1) - 0.55) < 1e-6);
+});
+```
+
+- [ ] **Step 2 → 5:**
+
+```javascript
+function ensemble(signals, weights) {
+  const e = (signals.echo       ?? 0) * (weights.echo       ?? 0);
+  const c = (signals.correction ?? 0) * (weights.correction ?? 0);
+  const f = (signals.foresight  ?? 0) * (weights.foresight  ?? 0);
+  return Math.max(-1, Math.min(1, e + c + f));
+}
+
+function emaUpdate(prev, reward, smoothing) {
+  return prev + smoothing * (reward - prev);
+}
+
+module.exports.ensemble = ensemble;
+module.exports.emaUpdate = emaUpdate;
+```
+
+```bash
+npm run format && npm run lint
+git add src/reward.js test/reward.test.js
+git commit -m "feat(reward): ensemble + EMA helpers (§6.5)"
+```
+
+---
+
+### Task β.8: `src/observer.js` — post-turn router (observe-only in β)
+
+**Files:** Create `src/observer.js`, `test/observer.test.js`.
+
+Per §6.2: one place that dispatches reward + persona + foresight closure.
+
+- [ ] **Step 1: Tests**
+
+```javascript
+const test   = require('node:test');
+const assert = require('node:assert/strict');
+const Observer = require('../src/observer.js');
+
+test('dispatches to reward, persona, foresight in order', async () => {
+  const calls = [];
+  const fakePersona = { observeResponse: () => calls.push('persona') };
+  const fakeReward  = { compute: async () => { calls.push('reward'); return 0.3; } };
+  const fakeForesight = { tryClose: async () => { calls.push('foresight'); } };
+
+  const o = new Observer({
+    cognitive: { reward: { enabled: true, observeOnly: true, weights: {} } },
+  }, { /* history */ }, fakeReward, fakePersona, fakeForesight);
+
+  await o.onAssistantTurn({
+    sessionKey: 'k', turnId: 1, userText: 'q', responseText: 'r',
+    manifest: { items: [] },
+  });
+  assert.deepEqual(calls, ['reward', 'persona', 'foresight']);
+});
+
+test('observeOnly=true: does not call DB write methods', async () => {
+  let wrote = false;
+  const history = {
+    updateLessonPrecision: () => { wrote = true; },
+    updateSceneInjectionScore: () => { wrote = true; },
+    updateMemcellImportance: () => { wrote = true; },
+  };
+  const o = new Observer(
+    { cognitive: { reward: { enabled: true, observeOnly: true, weights: {} } } },
+    history,
+    { compute: async () => 0.5 },
+    { observeResponse: () => {} },
+    { tryClose: async () => {} },
+  );
+  await o.onAssistantTurn({
+    sessionKey: 'k', turnId: 1, userText: 'q', responseText: 'r',
+    manifest: { items: [{ kind: 'lesson', id: 7 }] },
+  });
+  assert.equal(wrote, false, 'no DB write should occur in observe-only mode');
+});
+```
+
+- [ ] **Step 2 → 5: Implement** `src/observer.js`:
+
+```javascript
+const log = require('./lib/logger.js').make('observer');
+
+class Observer {
+  constructor(config, history, rewardLib, persona, foresight) {
+    this.cfg      = config.cognitive?.reward || {};
+    this.history  = history;
+    this.reward   = rewardLib;
+    this.persona  = persona;
+    this.foresight = foresight;
+  }
+
+  async onAssistantTurn({ sessionKey, turnId, userText, responseText, manifest }) {
+    let r = 0;
+    try {
+      r = await this.reward.compute({ userText, responseText, manifest, history: this.history });
+    } catch (e) { log.warn('reward.compute:', e.message); }
+
+    try { this.persona?.observeResponse?.(sessionKey, turnId, responseText); }
+    catch (e) { log.warn('persona.observeResponse:', e.message); }
+
+    try { await this.foresight?.tryClose?.(sessionKey, turnId, responseText); }
+    catch (e) { log.warn('foresight.tryClose:', e.message); }
+
+    const items = manifest?.items?.length ?? 0;
+    log.info(`turn=${turnId} items=${items} reward_ema=${r.toFixed(3)} ${this.cfg.observeOnly ? '(observe-only)' : ''}`);
+
+    if (this.cfg.observeOnly) return;
+    // Phase γ writes will land here.
+  }
+}
+
+module.exports = Observer;
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+npm run format && npm run lint
+git add src/observer.js test/observer.test.js
+git commit -m "feat(observer): post-turn router skeleton (§6.2) — observe-only β
+
+Three-way dispatch: reward.compute, persona.observeResponse, foresight.tryClose.
+In Phase β observeOnly=true; reward.compute returns an EMA but no DB
+write happens. γ flips the flag and adds the write-back path."
+```
+
+---
+
+### Task β.9: Selector — retrieve lessons (function only, not wired)
+
+**Files:** Modify `src/selector.js`, `test/selector.test.js`.
+
+Add a `retrieveLessons(sessionKey, queryVec, currentModel, maxK)` method
+on Selector. Don't wire it into `select()` yet — that's β.10.
+
+- [ ] **Step 1: Test** the helper directly with a fake history.
+
+```javascript
+test('retrieveLessons: scores by cosine, returns top K active, skips wrong-model', () => {
+  const mkVec = (n) => new Float32Array(n);
+  const fakeHistory = {
+    getActiveLessons: () => [
+      { id: 1, content: 'a', embedding: Buffer.from(new Float32Array([1, 0, 0]).buffer), embedding_model: 'm', precision_score: 0.5, recall_count: 0 },
+      { id: 2, content: 'b', embedding: Buffer.from(new Float32Array([0, 1, 0]).buffer), embedding_model: 'm', precision_score: 0.5, recall_count: 0 },
+      { id: 3, content: 'c', embedding: Buffer.from(new Float32Array([1, 0, 0]).buffer), embedding_model: 'OTHER', precision_score: 0.5, recall_count: 0 },
+    ],
+  };
+  const Selector = require('../src/selector.js');
+  const s = new Selector({ context: {} }, fakeHistory, { model: 'm' });
+  const out = s.retrieveLessons('sess', new Float32Array([1, 0, 0]), 'm', 5);
+  assert.equal(out.length, 2, 'wrong-model lesson must be skipped');
+  assert.equal(out[0].id, 1, 'aligned lesson ranks first');
+});
+```
+
+- [ ] **Step 2 → 5:** Implement in `src/selector.js`:
+
+```javascript
+retrieveLessons(sessionKey, queryVec, currentModel, maxK = 8) {
+  if (!queryVec) return [];
+  const lessons = this.history.getActiveLessons(sessionKey) || [];
+  return lessons
+    .filter((l) => !l.embedding_model || l.embedding_model === currentModel)
+    .map((l) => {
+      const lv = HistoryStore.toFloat32(l.embedding);
+      const sim = lv ? Embedder.cosine(queryVec, lv) : 0;
+      return { ...l, sim, score: sim + 0.2 * (l.precision_score - 0.5) };
+    })
+    .filter((l) => l.sim >= 0.35)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxK);
+}
+```
+
+Commit:
+
+```bash
+npm run format && npm run lint
+git add src/selector.js test/selector.test.js
+git commit -m "feat(selector): retrieveLessons helper (read-only, not yet wired)
+
+Filters by embedding-model compatibility, scores by cosine + small
+precision_score bias, returns top K. Phase β.10 wires it into select()
+under reflective intent only."
+```
+
+---
+
+### Task β.10: Selector — inject `<lessons>` block on `reflective` only
+
+**Files:** Modify `src/selector.js`, `test/selector.test.js`.
+
+Per §12 phase β: lessons inject *only* when intent === 'reflective'.
+
+- [ ] **Step 1:** Test. With the heuristic classifier and a query like
+  "what have we learned about deployments?", we should see a `<lessons>`
+  block in the assembled system message. With `"what's the port number?"`
+  we should NOT.
+
+- [ ] **Step 2 → 4:** Modify `Selector.select()` to accept an `intent`
+  parameter (passed in from proxy). In `_buildSystemWithMemory`, gate
+  the lessons block on `intent === 'reflective'`. Concatenate after
+  `<character>` and before `<memory>`.
+
+- [ ] **Step 5:** Commit:
+
+```bash
+git add src/selector.js test/selector.test.js
+git commit -m "feat(selector): inject <lessons> block on reflective intent (Phase β)
+
+Gates lesson injection to intent='reflective' per spec §12 phase β.
+broad and narrow intents fall through to existing v0.4.0 selector
+behaviour plus the v0.5.0 scaffold. recall_count + last_recalled_at
+bookkeeping fires for every injected lesson."
+```
+
+---
+
+### Task β.11: Selector — emit injection manifest
+
+**Files:** Modify `src/selector.js`, `test/selector.test.js`.
+
+`select()` now returns `{ messages, manifest }` instead of just messages.
+
+- [ ] **Steps 1–5:** Update return type; cascade the change through `proxy.js`
+  (the caller). The manifest schema is from §7.5.
+
+```bash
+git add src/selector.js src/proxy.js test/selector.test.js
+git commit -m "feat(selector): return { messages, manifest } per §7.5
+
+Manifest enumerates per-injected-item kind/id/tokens for the observer.
+Proxy stashes it in the new ManifestStore (TTL'd) keyed by request_id."
+```
+
+---
+
+### Task β.12: Wire intent classifier + observer + manifest into proxy.js
+
+**Files:** Modify `src/proxy.js`.
+
+In the chat-completions handler:
+
+1. Compute `intent = intent.classify(queryText, config.cognitive?.selector?.intent)` before calling selector.
+2. Pass `intent` into `selector.select()`.
+3. Receive `{ messages, manifest }`; stash in `ManifestStore` keyed by a per-request UUID.
+4. Replace the scaffold's hard-coded `'narrow'` with the real `intent`.
+5. After response is returned to the client, in the `recordAssistantTurn`
+   path, call `observer.onAssistantTurn({...manifest, ...})` instead of
+   the existing per-pipeline calls.
+
+- [ ] **Steps 1–5:** Implement. Run tests. Commit:
+
+```bash
+git add src/proxy.js
+git commit -m "feat(proxy): wire intent.classify + observer + ManifestStore (β)
+
+intent: heuristic by default; per-request UUID keys the manifest store;
+observer dispatches on response finish. observeOnly=true in β config —
+no DB write yet."
+```
+
+---
+
+### Task β.13: Status endpoint — intent_mix + reward_ema
+
+**Files:** Modify `src/proxy.js`, `test/integration/status-endpoint.test.js`.
+
+Per §10.1. Track a rolling 100-turn intent counter and a global reward EMA
+in process memory (no DB).
+
+- [ ] **Steps:** Add a small `Telemetry` object: `{ intentCounts: {broad,narrow,reflective}, rewardEma }`. Bump from observer + selector. Status reads it.
+
+```bash
+git add src/proxy.js test/integration/status-endpoint.test.js
+git commit -m "feat(observability): intent_mix + reward_ema in status (§10.1)"
+```
+
+---
+
+### Task β.14: Phase β merge-readiness
+
+Same shape as Task 15: `npm test` green, lint clean, format clean,
+proxy boots, optional live smoke.
+
+Commit:
+
+```bash
+git commit --allow-empty -m "chore: Phase β ready for merge"
+```
+
+---
+
+**End of Chunk 2 (Phase β).**
+
+---
+
+## Chunk 3: Phase γ — Lessons on all intents + reward write-back + refute loop
+
+**Phase γ exit criteria (from spec §12):**
+
+- Selector reads lessons on **every** intent, not just reflective.
+- Observer flips `observeOnly=false`: reward EMA writes back to
+  `lessons.precision_score` and `memscenes.injection_score`.
+  `memcells.importance` is **untouched** (guarded by
+  `reward.writebackLegacyImportance=false`).
+- Refutation loop: when a new memcell is inserted, distiller side-checks
+  active lessons for contradictions; over-threshold lessons trigger
+  LLM-mediated re-validation (`refute` / `revise` / `retire`).
+- Selector applies the exploration bonus and mean-reversion-to-0.5
+  on idle lessons (§6.4, §5.5).
+- New endpoint: `GET /anamnesis/lessons?limit=N&category=X&status=active`.
+- v0.4.0 rollback still bit-for-bit: `cognitive.lessons.enabled=false`
+  reverts to v0.4.0 selector.
+
+**Chunk 3 file plan:**
+
+| File                          | Action | Why                                                   |
+| ----------------------------- | ------ | ----------------------------------------------------- |
+| `src/observer.js`             | modify | Flip on write-back to `lessons.precision_score` and `memscenes.injection_score`. |
+| `src/selector.js`             | modify | Lesson injection on all intents; exploration bonus.   |
+| `src/history.js`              | modify | Mean-reversion + idle-retire on cron; refute helpers. |
+| `src/distiller.js`            | modify | refute-on-cell-insert side-check + LLM revalidator.   |
+| `src/proxy.js`                | modify | New `/anamnesis/lessons` read endpoint.               |
+| Various `test/*.test.js`      | modify | New write-back paths, refute loop, /lessons endpoint. |
+
+---
+
+### Task γ.1: Flip observer write-back to new columns
+
+**Files:** `src/observer.js`, `src/history.js`, `test/observer.test.js`.
+
+- [ ] **Step 1:** Test that with `observeOnly=false`, observer calls
+  `history.updateLessonPrecision(id, ema)` and
+  `history.updateSceneInjectionScore(id, ema)` for each manifest item.
+- [ ] **Step 2–4:** Implement those two methods on `HistoryStore`; replace
+  the `if (observeOnly) return;` early-return in observer with the write
+  loop. Each per-item `r` is computed from the manifest's prior-turn echo
+  + correction + foresight signals (§6.3, §6.5). Mean reversion applies
+  at write time.
+
+```bash
+git commit -m "feat(observer): write-back to lessons.precision_score + memscenes.injection_score (γ)
+
+Targets new columns only; legacy memcells.importance untouched (gated
+by reward.writebackLegacyImportance=false until 1.0). Rollback to v0.4.0
+remains bit-for-bit by setting cognitive.lessons.enabled=false."
+```
+
+---
+
+### Task γ.2: Selector — inject lessons on all intents
+
+**Files:** `src/selector.js`, `test/selector.test.js`.
+
+- [ ] Lift the β.10 reflective-only gate. Allocations remain uniform
+  25/25/25/25 (Chunk 4 calibrates).
+- [ ] Each intent draws a different K from `retrieveLessons` based on the
+  allocations table (lessons-budget / avg-lesson-tokens).
+
+```bash
+git commit -m "feat(selector): inject lessons on broad+narrow+reflective (γ)"
+```
+
+---
+
+### Task γ.3: Exploration bonus + mean reversion
+
+**Files:** `src/selector.js`, `src/history.js`, `test/selector.test.js`.
+
+Per §6.4: UCB-style `sqrt(ln(sessionTurns+1) / (recall_count+1)) * explorationWeight`
+on the selector's lesson scoring; nightly cron (piggybacks on the
+consolidator's existing schedule) calls `history.applyLessonMeanReversion()`
+which nudges idle `precision_score` toward 0.5.
+
+- [ ] **Steps 1–5:** Implement + test.
+
+```bash
+git commit -m "feat(selector,history): UCB exploration + mean-reversion-to-0.5 (§6.4)"
+```
+
+---
+
+### Task γ.4: Distiller — refute_count side-check on memcell insertion
+
+**Files:** `src/distiller.js`, `src/extractor.js`, `src/history.js`, `test/distiller.test.js`.
+
+Per §5.4: when extractor inserts a new memcell, hand it to
+`distiller.checkAgainstActiveLessons(memcellId)`. The check is the
+cheap textual probe (no LLM call).
+
+- [ ] **Steps 1–5:** Implement. Probe = "negation marker + shared noun"
+  heuristic. Increments `refute_count`; over threshold enqueues for
+  LLM-mediated revalidation.
+
+```bash
+git commit -m "feat(distiller): refute_count probe on every memcell insertion (§5.4)"
+```
+
+---
+
+### Task γ.5: Distiller — LLM-mediated refutation (revise / retire / hold)
+
+**Files:** `src/distiller.js`, `test/distiller.test.js`.
+
+Per §5.4: when `refute_count >= lessonRefuteThreshold`, call the LLM
+with the original lesson + N contradicting cells; act on `(a) holds /
+(b) revise / (c) retire`. Verbatim prompt pinned by test like
+LESSON_PROMPT.
+
+- [ ] **Steps 1–5:** Implement. New prompt `REFUTE_PROMPT` pinned to
+  spec §5.4. `status='superseded'` + `superseded_by` chains for revisions.
+
+```bash
+git commit -m "feat(distiller): refute → revise / retire / hold (§5.4)
+
+LLM-mediated revalidation when refute_count crosses threshold. Hold
+resets count + bumps last_validated_at. Revise creates a successor
+lesson and marks the old superseded. Retire marks the old retired."
+```
+
+---
+
+### Task γ.6: `GET /anamnesis/lessons` read endpoint
+
+**Files:** `src/proxy.js`, `test/integration/lessons-endpoint.test.js`.
+
+Per §10.2. Read-only; supports `?limit=N&category=X&status=active`.
+
+- [ ] **Steps 1–5:** Implement. Returns JSON list. No edit support (v0.6.0).
+
+```bash
+git commit -m "feat(proxy): GET /anamnesis/lessons — read-only listing (§10.2)"
+```
+
+---
+
+### Task γ.7: Phase γ merge-readiness
+
+`npm test` green, lint clean, format clean, full re-smoke on the live
+install with a real backlog. CHANGELOG updated.
+
+```bash
+git commit -m "chore: Phase γ ready for merge"
+```
+
+---
+
+**End of Chunk 3 (Phase γ).**
+
+---
+
+## Chunk 4: Phase 1.0 — Legacy importance + bench + production allocations
+
+**Phase 1.0 exit criteria (from spec §12):**
+
+- `memcells.importance_v04_snapshot` column added by migration; a
+  one-time snapshot of `importance` is written at the moment
+  `reward.writebackLegacyImportance` is flipped to `true`.
+- Observer write-back targets `memcells.importance` too. Rollback path:
+  the snapshot column lets ops restore v0.4.0 values via one SQL
+  `UPDATE memcells SET importance = importance_v04_snapshot`.
+- `bench/` directory exists with: run.sh, grader spec, fixtures for
+  the four task categories (§13.1), and a regenerable `REPORT.md`.
+- Production allocations in `config.json` are replaced by the
+  bench-derived table.
+- v1.0.0 tag pushed.
+
+**Chunk 4 file plan:**
+
+| File                                | Action | Why                                              |
+| ----------------------------------- | ------ | ------------------------------------------------ |
+| `src/history.js`                    | modify | importance_v04_snapshot column + snapshot helper. |
+| `src/observer.js`                   | modify | Legacy-importance write-back behind flag.        |
+| `bench/run.sh`                      | create | Driver for the four task categories.             |
+| `bench/grader.md`                   | create | Pinned grader prompt (file hash for traceability). |
+| `bench/fixtures/*`                  | create | Setup + held-out continuation conversations.     |
+| `bench/REPORT.md`                   | create | Regenerable output (committed for posterity).    |
+| `config.json`                       | modify | Replace uniform allocations with bench values.   |
+| `CHANGELOG.md`                      | modify | v1.0.0 release notes.                            |
+| `docs/launch/v0.5.0.md`             | create | Marketing narrative (appendix A relocated).      |
+
+---
+
+### Task 1.0.1: Add `importance_v04_snapshot` column
+
+**Files:** `src/history.js`, `test/history.test.js`.
+
+- [ ] Migration: `ALTER TABLE memcells ADD COLUMN importance_v04_snapshot REAL`.
+- [ ] Helper `snapshotLegacyImportance()`: one-shot, idempotent (no-op if
+  any row already has a non-NULL snapshot).
+
+```bash
+git commit -m "feat(history): importance_v04_snapshot column + one-shot snapshot helper (1.0 prep)"
+```
+
+---
+
+### Task 1.0.2: Flip `reward.writebackLegacyImportance` to true (after snapshot)
+
+**Files:** `src/observer.js`, `src/proxy.js`, `test/observer.test.js`.
+
+- [ ] Boot path: if `cognitive.reward.writebackLegacyImportance=true` and
+  no snapshot exists, call `history.snapshotLegacyImportance()` once.
+- [ ] Observer write-back path: also update `memcells.importance` via
+  EMA + reward signal.
+- [ ] Tests assert the snapshot fires before the first write-back, never
+  on subsequent boots.
+
+```bash
+git commit -m "feat(observer): legacy importance write-back behind flag with snapshot guard (§12.2)"
+```
+
+---
+
+### Task 1.0.3: bench/ directory scaffold
+
+**Files:** Create `bench/run.sh`, `bench/grader.md`, `bench/fixtures/*`,
+`bench/README.md`.
+
+- [ ] `bench/run.sh` drives the four task categories from §13.1.
+  Outputs a `bench/results-<ISO>.json`.
+- [ ] `bench/grader.md` pins model (`gpt-oss-20b`), temperature `0.0`,
+  prompt version, and a SHA hash check.
+- [ ] Fixtures: setup conversation (seen by distiller) + held-out
+  continuation (graded). One fixture pair per task category.
+
+```bash
+git commit -m "chore(bench): scaffold + four-task harness (§13)
+
+bench/run.sh: driver; bench/grader.md: pinned grader; fixtures/:
+setup+held-out pairs per category. Methodology constraints from
+§13.2-§13.4 enforced (no train/test leakage; pinned grader;
+no-CPU-llama-on-latency)."
+```
+
+---
+
+### Task 1.0.4: Run bench, calibrate production allocations
+
+**Files:** `bench/REPORT.md`, `config.json`.
+
+- [ ] Sweep `allocations[intent]` over a small grid (e.g. step 10% on
+  each tier within budget=1.0 constraint). Record per-intent best.
+- [ ] Update `config.json` `cognitive.selector.allocations` block.
+- [ ] CHANGELOG note: "γ → 1.0 allocations" — explicit before/after.
+
+```bash
+git commit -m "chore(bench,config): production allocations from bench sweep
+
+Replaces the uniform 25/25/25/25 baseline that shipped in α/β.
+Values per-intent recorded in CHANGELOG."
+```
+
+---
+
+### Task 1.0.5: Move launch narrative to `docs/launch/v0.5.0.md`
+
+**Files:** Create `docs/launch/v0.5.0.md`, modify spec Appendix A.
+
+The spec's Appendix A is marketing material; spec hygiene says it
+moves to `docs/launch/` at release time.
+
+```bash
+git commit -m "docs: relocate Appendix A → docs/launch/v0.5.0.md"
+```
+
+---
+
+### Task 1.0.6: CHANGELOG + tag v1.0.0
+
+**Files:** `CHANGELOG.md`, `package.json`.
+
+- [ ] Promote `[0.5.0-alpha]` to `[0.5.0]` with the complete picture.
+- [ ] Bump `package.json` version to `0.5.0`.
+- [ ] Tag:
+
+```bash
+git tag -a v0.5.0 -m "Anamnesis v0.5.0 — Cognitive Loop"
+git push --tags
+```
+
+```bash
+git commit -m "chore: release v0.5.0 — Cognitive Loop (lessons, reward, hierarchical selector, scaffold)"
+```
+
+---
+
+### Task 1.0.7: Phase 1.0 merge-readiness
+
+Final checks. Push the branch with the v0.5.0 tag. PR
+`feat/cognitive-loop` → `main` ready to merge.
+
+```bash
+git commit --allow-empty -m "chore: v0.5.0 ready"
+```
+
+---
+
+**End of Chunk 4 (Phase 1.0).**
+
+---
+
+## Execution
+
+The plan is complete. Next step per `superpowers:writing-plans`:
+invoke `superpowers:subagent-driven-development` to execute Chunk 1
+first. Chunks 2, 3, 4 follow after each preceding chunk is merged and
+lived with.
 
