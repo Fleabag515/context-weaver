@@ -78,4 +78,37 @@ function isTrivial(messages, cfg = {}) {
   return false;
 }
 
-module.exports = { isTrivial, DEFAULT_TRIVIAL_MARKERS };
+/**
+ * Verbatim plan-block prompt. Pinned for v0.5.0.
+ * MUST NOT contain enable_thinking or <|think_on|> — see §7A.4 and the
+ * reasoning-proxy postmortem.
+ */
+const PLAN_BLOCK = `
+
+<reasoning_policy>
+Before producing the final answer, in <think>:
+  1. Restate what's actually being asked.
+  2. List the sub-questions you need to resolve.
+  3. Identify tools to call, or note "no tools needed".
+  4. Anticipate what would make a naive answer wrong.
+  5. Sketch the answer's shape.
+
+Then produce the answer.
+</reasoning_policy>`;
+
+/**
+ * Returns the plan-injection block for the given intent, or empty string
+ * if disabled / intent is in skipOnIntent.
+ *
+ * @param {string} intent — "broad" | "narrow" | "reflective"
+ * @param {Object} cfg    — scaffold config block. Reads cfg.plan.{enabled,skipOnIntent}.
+ */
+function planBlock(intent, cfg = {}) {
+  const planCfg = cfg.plan || {};
+  if (planCfg.enabled === false) return '';
+  const skip = planCfg.skipOnIntent || [];
+  if (skip.includes(intent)) return '';
+  return PLAN_BLOCK;
+}
+
+module.exports = { isTrivial, planBlock, DEFAULT_TRIVIAL_MARKERS, PLAN_BLOCK };

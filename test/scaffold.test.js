@@ -99,3 +99,43 @@ test('isTrivial: custom marker list', () => {
   assert.equal(isTrivial([{ role: 'user', content: 'custom-marker' }], cfg), true);
   assert.equal(isTrivial([{ role: 'user', content: 'thanks' }], cfg), false);
 });
+
+const { planBlock } = require('../src/scaffold.js');
+
+const PLAN_CFG = {
+  plan: { enabled: true, skipOnIntent: ['broad'] },
+};
+
+test('planBlock: returns verbatim block on narrow intent', () => {
+  const b = planBlock('narrow', PLAN_CFG);
+  assert.match(b, /<reasoning_policy>/);
+  assert.match(b, /Before producing the final answer, in <think>:/);
+  assert.match(b, /<\/reasoning_policy>/);
+});
+
+test('planBlock: returns verbatim block on reflective intent', () => {
+  const b = planBlock('reflective', PLAN_CFG);
+  assert.match(b, /<reasoning_policy>/);
+});
+
+test('planBlock: empty string on broad intent', () => {
+  assert.equal(planBlock('broad', PLAN_CFG), '');
+});
+
+test('planBlock: empty string when disabled', () => {
+  assert.equal(planBlock('narrow', { plan: { enabled: false, skipOnIntent: [] } }), '');
+});
+
+test('planBlock: empty string when intent in skipOnIntent', () => {
+  assert.equal(planBlock('narrow', { plan: { enabled: true, skipOnIntent: ['narrow'] } }), '');
+});
+
+test('planBlock: never contains thinking-mode override tokens', () => {
+  // Belt-and-braces guard from §14 — plan injection rides on behavioural
+  // prompting only; must NEVER contain enable_thinking or <|think_on|>.
+  for (const intent of ['narrow', 'reflective']) {
+    const b = planBlock(intent, PLAN_CFG);
+    assert.ok(!b.includes('enable_thinking'), 'must not contain enable_thinking');
+    assert.ok(!b.includes('think_on'), 'must not contain <|think_on|>');
+  }
+});
