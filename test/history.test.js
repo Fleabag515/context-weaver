@@ -109,6 +109,85 @@ maybeTest('schema: memscenes.injection_score exists with default 0.5', () => {
   }
 });
 
+maybeTest('lessons CRUD: insert, list active, bump recall', () => {
+  const { dir, dbPath } = tmpDb();
+  const h = new HistoryStore(dbPath);
+  try {
+    const id1 = h.insertLesson({
+      sessionKey: 's1',
+      content: 'User prefers concise code reviews.',
+      embedding: new Float32Array([0.1, 0.2, 0.3]),
+      embeddingModel: 'nomic-embed-cpu:latest',
+      category: 'preference',
+      confidence: 0.8,
+      supportingSceneIds: [11, 12],
+      supportingMemcellIds: [101, 102, 103],
+    });
+    assert.ok(id1 > 0);
+
+    const id2 = h.insertLesson({
+      sessionKey: 's1',
+      content: 'retired lesson',
+      embedding: null,
+      embeddingModel: null,
+      category: 'other',
+      confidence: 0.1,
+      supportingSceneIds: [],
+      supportingMemcellIds: [],
+    });
+    h.db.prepare("UPDATE lessons SET status='retired' WHERE id=?").run(id2);
+
+    const active = h.getActiveLessons('s1');
+    assert.equal(active.length, 1);
+    assert.equal(active[0].id, id1);
+    assert.equal(active[0].recall_count, 0);
+
+    h.bumpLessonRecall(id1);
+    h.bumpLessonRecall(id1);
+    const after = h.db
+      .prepare('SELECT recall_count, last_recalled_at FROM lessons WHERE id=?')
+      .get(id1);
+    assert.equal(after.recall_count, 2);
+    assert.ok(after.last_recalled_at > 0);
+  } finally {
+    h.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+maybeTest('lessons: getActiveLessons scopes by session_key', () => {
+  const { dir, dbPath } = tmpDb();
+  const h = new HistoryStore(dbPath);
+  try {
+    h.insertLesson({
+      sessionKey: 's1',
+      content: 'a',
+      embedding: null,
+      embeddingModel: null,
+      category: 'other',
+      confidence: 0.5,
+      supportingSceneIds: [],
+      supportingMemcellIds: [],
+    });
+    h.insertLesson({
+      sessionKey: 's2',
+      content: 'b',
+      embedding: null,
+      embeddingModel: null,
+      category: 'other',
+      confidence: 0.5,
+      supportingSceneIds: [],
+      supportingMemcellIds: [],
+    });
+    assert.equal(h.getActiveLessons('s1').length, 1);
+    assert.equal(h.getActiveLessons('s2').length, 1);
+    assert.equal(h.getActiveLessons('nonexistent').length, 0);
+  } finally {
+    h.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 maybeTest('foresight_scanned is independent of extracted', () => {
   const { dir, dbPath } = tmpDb();
   const h = new HistoryStore(dbPath);

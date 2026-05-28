@@ -454,6 +454,72 @@ class HistoryStore {
       .all(sessionKey, limit);
   }
 
+  // ─── Lessons ──────────────────────────────────────────────────────────────
+
+  insertLesson({
+    sessionKey,
+    content,
+    embedding,
+    embeddingModel,
+    category = 'other',
+    confidence = 0.5,
+    supportingSceneIds = [],
+    supportingMemcellIds = [],
+  }) {
+    const blob = embedding ? Buffer.from(embedding.buffer) : null;
+    return this.db
+      .prepare(
+        `
+      INSERT INTO lessons
+        (session_key, content, embedding, embedding_model, category,
+         confidence, supporting_scene_ids, supporting_memcell_ids)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `
+      )
+      .run(
+        sessionKey,
+        content,
+        blob,
+        embeddingModel,
+        category,
+        confidence,
+        JSON.stringify(supportingSceneIds),
+        JSON.stringify(supportingMemcellIds)
+      ).lastInsertRowid;
+  }
+
+  getActiveLessons(sessionKey) {
+    return this.db
+      .prepare(
+        `
+      SELECT id, content, embedding, embedding_model, category, confidence,
+             supporting_scene_ids, supporting_memcell_ids,
+             refute_count, precision_score, recall_count,
+             last_recalled_at, last_validated_at, created_at, updated_at, status
+      FROM lessons
+      WHERE session_key=? AND status='active'
+      ORDER BY updated_at DESC
+    `
+      )
+      .all(sessionKey);
+  }
+
+  countActiveLessons() {
+    return this.db.prepare("SELECT COUNT(*) as n FROM lessons WHERE status='active'").get().n;
+  }
+
+  countLessons() {
+    return this.db.prepare('SELECT COUNT(*) as n FROM lessons').get().n;
+  }
+
+  bumpLessonRecall(id) {
+    this.db
+      .prepare(
+        'UPDATE lessons SET recall_count = recall_count + 1, last_recalled_at = unixepoch() WHERE id=?'
+      )
+      .run(id);
+  }
+
   markForesightFulfilled(id) {
     this.db.prepare('UPDATE foresights SET fulfilled=1 WHERE id=?').run(id);
   }
