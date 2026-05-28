@@ -42,8 +42,9 @@ const Embedder = require('./embedder.js');
 const Selector = require('./selector.js');
 const Extractor = require('./extractor.js');
 const ForesightExtractor = require('./foresight.js');
-const PersonaManager      = require('./persona.js');
+const PersonaManager = require('./persona.js');
 const Consolidator = require('./consolidator.js');
+const scaffold = require('./scaffold.js');
 
 function loadConfig() {
   return expandHome(JSON.parse(fs.readFileSync(path.join(__dirname, '../config.json'), 'utf8')));
@@ -52,12 +53,20 @@ function loadConfig() {
 async function start(config = loadConfig()) {
   const history = new HistoryStore(config.history.dbPath);
   const embedder = new Embedder(config.embedding.ollamaUrl, config.embedding.model);
-  const persona  = new PersonaManager(config, history);
+  const persona = new PersonaManager(config, history);
   await persona.init();
   const selector = new Selector(config, history, embedder, persona);
   const extractor = new Extractor(config, history, embedder);
   const foresightExtractor = new ForesightExtractor(config, history);
   const consolidator = new Consolidator(config, history, embedder);
+
+  const scaffoldCfg = (config.cognitive && config.cognitive.scaffold) || {
+    trivialEnabled: true,
+    trivialMaxChars: 80,
+    trivialMarkers: scaffold.DEFAULT_TRIVIAL_MARKERS,
+    plan: { enabled: false, skipOnIntent: ['broad'] }, // off by default; flipped on by config
+    toolReflection: { enabled: false }, // off by default; flipped on by config
+  };
 
   const pruned = history.prune(config.history.maxAgeDays);
   if (pruned > 0) log.info(`pruned ${pruned} old turns`);
@@ -205,6 +214,20 @@ async function start(config = loadConfig()) {
         const sessionKey = getSessionKey(req.headers, config.upstream.apiKey);
         const streaming = parsed.stream === true;
 
+        // 0. Reasoning-scaffold trivial gate — spec §7A.6.
+        // Trivial requests bypass memory + scaffold entirely. We still
+        // persist the user turn so the next turn has context.
+        if (scaffold.isTrivial(parsed.messages, scaffoldCfg)) {
+          const trivUserMsg = [...parsed.messages].reverse().find((m) => m.role === 'user');
+          const trivUserText = extractContentText(trivUserMsg?.content);
+          if (trivUserText) {
+            const vec = await embedder.embed(trivUserText).catch(() => null);
+            const est = Math.ceil(trivUserText.length / config.context.charsPerToken);
+            history.insertTurn(sessionKey, 'user', trivUserText, vec, est, embedder.model);
+          }
+          return passthrough(req, res, rawBody);
+        }
+
         // 1. Persist user turn synchronously.
         // Content may be a string OR an array of OpenAI content-parts
         // (text + tool_result + image_url etc). Flatten before storage —
@@ -224,6 +247,31 @@ async function start(config = loadConfig()) {
           selectedMessages = await selector.select(sessionKey, parsed.messages);
         } catch (err) {
           log.error('selector error, falling back to original messages:', err.message);
+        }
+
+        // 2b. Scaffold suffix — plan + tool-reflection appended to the
+        // last system message. Phase α: intent hard-wired to 'narrow';
+        // intent classifier ships in Chunk 2.
+        const intent = 'narrow';
+        const planSuffix = scaffold.planBlock(intent, scaffoldCfg);
+        const toolSuffix = scaffold.toolReflectionBlock(parsed.messages, scaffoldCfg);
+        if (planSuffix || toolSuffix) {
+          const systemIdxs = selectedMessages
+            .map((m, i) => (m.role === 'system' ? i : -1))
+            .filter((i) => i >= 0);
+          const lastSystemIdx = systemIdxs.length ? systemIdxs[systemIdxs.length - 1] : undefined;
+          if (lastSystemIdx !== undefined) {
+            selectedMessages = [...selectedMessages];
+            selectedMessages[lastSystemIdx] = {
+              ...selectedMessages[lastSystemIdx],
+              content: selectedMessages[lastSystemIdx].content + planSuffix + toolSuffix,
+            };
+          } else {
+            selectedMessages = [
+              { role: 'system', content: (planSuffix + toolSuffix).trim() },
+              ...selectedMessages,
+            ];
+          }
         }
 
         // 3. Rewrite + forward.
