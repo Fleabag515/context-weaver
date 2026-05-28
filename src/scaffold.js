@@ -111,4 +111,36 @@ function planBlock(intent, cfg = {}) {
   return PLAN_BLOCK;
 }
 
-module.exports = { isTrivial, planBlock, DEFAULT_TRIVIAL_MARKERS, PLAN_BLOCK };
+/**
+ * Verbatim tool-reflection block. Pinned for v0.5.0.
+ */
+const TOOL_REFLECTION_BLOCK = `
+
+<tool_reflection>
+A tool just returned a result. Before continuing:
+  - Did the tool result actually answer the sub-question you were resolving?
+  - If partial or unhelpful: what's the next step? Another tool call,
+    a different query, or admit the gap?
+</tool_reflection>`;
+
+/**
+ * Returns the tool-reflection block iff the last message is a tool
+ * result and the feature is enabled.
+ */
+function toolReflectionBlock(messages, cfg = {}) {
+  const trCfg = cfg.toolReflection || {};
+  if (trCfg.enabled === false) return '';
+  if (!Array.isArray(messages) || messages.length === 0) return '';
+  const last = messages[messages.length - 1];
+  if (!last || last.role !== 'tool') return '';
+  return TOOL_REFLECTION_BLOCK;
+}
+
+module.exports = {
+  isTrivial,
+  planBlock,
+  toolReflectionBlock,
+  DEFAULT_TRIVIAL_MARKERS,
+  PLAN_BLOCK,
+  TOOL_REFLECTION_BLOCK,
+};

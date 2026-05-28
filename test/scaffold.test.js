@@ -139,3 +139,40 @@ test('planBlock: never contains thinking-mode override tokens', () => {
     assert.ok(!b.includes('think_on'), 'must not contain <|think_on|>');
   }
 });
+
+const { toolReflectionBlock } = require('../src/scaffold.js');
+
+const TOOL_CFG = { toolReflection: { enabled: true } };
+
+test('toolReflectionBlock: fires when last message is role=tool', () => {
+  const b = toolReflectionBlock(
+    [
+      { role: 'user', content: 'list my issues' },
+      { role: 'assistant', content: 'calling tool…' },
+      { role: 'tool', tool_use_id: 'x', content: '{"issues":[]}' },
+    ],
+    TOOL_CFG
+  );
+  assert.match(b, /<tool_reflection>/);
+  assert.match(b, /A tool just returned a result/);
+  assert.match(b, /Did the tool result actually answer/);
+});
+
+test('toolReflectionBlock: empty when last message is user', () => {
+  assert.equal(toolReflectionBlock([{ role: 'user', content: 'hi' }], TOOL_CFG), '');
+});
+
+test('toolReflectionBlock: empty when last message is assistant', () => {
+  assert.equal(toolReflectionBlock([{ role: 'assistant', content: 'done' }], TOOL_CFG), '');
+});
+
+test('toolReflectionBlock: empty when disabled', () => {
+  assert.equal(
+    toolReflectionBlock([{ role: 'tool', content: '{}' }], { toolReflection: { enabled: false } }),
+    ''
+  );
+});
+
+test('toolReflectionBlock: empty on empty messages array', () => {
+  assert.equal(toolReflectionBlock([], TOOL_CFG), '');
+});
